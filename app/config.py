@@ -17,7 +17,7 @@ class Settings:
     inspect_workers: int = 4
     inspect_retry_attempts: int = 2
     inspect_stale_days: int = 30
-    dub_classifier_version: int = 8
+    dub_classifier_version: int = 9
     metadata_backfill_limit: int = 1000
     startup_metadata_backfill_limit: int = 250
     metadata_backfill_workers: int = 2

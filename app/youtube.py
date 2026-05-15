@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from typing import Any
 
 from .config import Settings
@@ -505,11 +505,27 @@ class YouTubeService:
             audio_track = fmt.get(key)
             if isinstance(audio_track, dict) and cls.audio_track_has_auto_dub_marker(audio_track):
                 return True
-        return cls.contains_auto_dub_marker(fmt.get("xtags"))
+        if cls.contains_auto_dub_marker(fmt.get("xtags")):
+            return True
+        return any(
+            cls.contains_auto_dub_marker(value)
+            for value in cls.format_url_xtags(fmt)
+        )
 
     @staticmethod
     def format_is_audio_only(fmt: dict[str, Any]) -> bool:
         return bool(fmt.get("acodec") and fmt.get("acodec") != "none" and fmt.get("vcodec") == "none")
+
+    @staticmethod
+    def format_url_xtags(fmt: dict[str, Any]) -> list[str]:
+        url = str(fmt.get("url") or "")
+        if not url:
+            return []
+        try:
+            query = parse_qs(urlparse(url).query)
+        except Exception:
+            return []
+        return [value for value in query.get("xtags", []) if value]
 
     @classmethod
     def format_is_original(cls, fmt: dict[str, Any]) -> bool:

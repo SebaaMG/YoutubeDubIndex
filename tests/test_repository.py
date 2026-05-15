@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.db import Database
 from app.repository import (
+    CURRENT_DUB_CLASSIFIER_VERSION,
     SPANISH_LANGUAGE_CODES,
     SPANISH_LANGUAGE_FILTER,
     CandidateVideo,
@@ -857,6 +858,45 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertEqual({item["video_id"] for item in manual}, {"manual1", "large1"})
         self.assertEqual(automatic, [])
+
+    def test_manual_filter_hides_old_ytdlp_manual_rows_until_reclassified(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo("oldytdlp001", "Old yt-dlp", "Chan", "chan1", 100, None, source_id, to_iso())
+        )
+        self.repo.store_inspection_result(
+            "oldytdlp001",
+            audio_languages=["en-US", "es-US"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={
+                "source": "yt_dlp",
+                "original_audio_languages": ["en-US"],
+                "auto_dubbed_languages": [],
+            },
+            classifier_version=CURRENT_DUB_CLASSIFIER_VERSION - 1,
+            published_at="2026-04-20",
+            view_count=100,
+        )
+
+        all_dubs = self.repo.list_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+        )
+        manual = self.repo.list_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+            dub_kind="manual",
+        )
+
+        self.assertEqual([item["video_id"] for item in all_dubs], ["oldytdlp001"])
+        self.assertEqual(manual, [])
 
     def test_store_inspection_ignores_descriptive_audio_for_dubbing(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))

@@ -13,7 +13,7 @@ from .db import Database
 
 SPANISH_LANGUAGE_FILTER = "__spanish__"
 SPANISH_LANGUAGE_CODES = ("es-US", "es", "es-419", "es-ES")
-CURRENT_DUB_CLASSIFIER_VERSION = 8
+CURRENT_DUB_CLASSIFIER_VERSION = 9
 INTERNAL_DISCOVERY_SOURCE_VALUE = "__auto_discovery__"
 CATALOG_SEARCH_PROBE_LIMIT = 5_000
 CATALOG_SEARCH_DENSE_MATCH_RATIO = 0.005
@@ -1981,6 +1981,20 @@ class Repository:
                 )
                 params.append(lang)
         elif dub_kind == "manual":
+            clauses.append(
+                "("
+                "COALESCE(v.dub_classifier_version, 0) >= ? "
+                "OR (COALESCE(v.dub_evidence_json, '') NOT LIKE ? "
+                "AND COALESCE(v.dub_evidence_json, '') NOT LIKE ?)"
+                ")"
+            )
+            params.extend(
+                [
+                    CURRENT_DUB_CLASSIFIER_VERSION,
+                    '%"source":"yt_dlp"%',
+                    '%"source": "yt_dlp"%',
+                ]
+            )
             if lang == SPANISH_LANGUAGE_FILTER or not lang:
                 clauses.append(
                     "EXISTS (SELECT 1 FROM video_audio_tracks t "

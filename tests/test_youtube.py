@@ -258,6 +258,29 @@ class YouTubeHelpersTests(unittest.TestCase):
 
         self.assertEqual(YouTubeService.extract_auto_dubbed_languages_from_info(info), ["es"])
 
+    def test_ytdlp_extracts_auto_dub_marker_from_format_url_xtags(self) -> None:
+        info = {
+            "formats": [
+                {
+                    "language": "en-US",
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "format_note": "English (US) original (default), medium",
+                    "url": "https://example.invalid/audio?xtags=acont%3Doriginal%3Alang%3Den-US",
+                },
+                {
+                    "language": "es-US",
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "format_note": "Spanish (US), medium",
+                    "url": "https://example.invalid/audio?xtags=acont%3Ddubbed-auto%3Alang%3Des-US",
+                },
+            ]
+        }
+
+        self.assertEqual(YouTubeService.extract_auto_dubbed_languages_from_info(info), ["es-US"])
+        self.assertEqual(YouTubeService.classify_dub_kind(["en-US", "es-US"], "", {}, info), "automatic")
+
     def test_ytdlp_non_original_spanish_without_auto_marker_stays_manual(self) -> None:
         info = {
             "formats": [
