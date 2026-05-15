@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Catalog · Dub Indexer{% endblock %}
+
+{% block content %}
+  <section class="card">
+    <h2>Filtros</h2>
+    <form action="/catalog" method="get" class="filters">
+      <label>
+        <span>Texto</span>
+        <input name="q" value="{{ selected.q }}">
+      </label>
+      <label>
+        <span>Idioma</span>
+        <select name="lang">
+          <option value="">Todos</option>
+          {% for lang in filters.languages %}
+            <option value="{{ lang }}" {% if selected.lang == lang %}selected{% endif %}>{{ lang }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Canal</span>
+        <select name="channel">
+          <option value="">Todos</option>
+          {% for channel in filters.channels %}
+            <option value="{{ channel }}" {% if selected.channel == channel %}selected{% endif %}>{{ channel }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Source</span>
+        <select name="source_id">
+          <option value="">Todas</option>
+          {% for source in sources %}
+            <option value="{{ source.id }}" {% if selected.source_id == source.id %}selected{% endif %}>{{ source.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" name="only_dubbed_toggle" value="1" {% if not selected.only_dubbed %}checked{% endif %} disabled>
+        <span>Diagnóstico rápido</span>
+      </label>
+      <label>
+        <span>Modo</span>
+        <select name="only_dubbed">
+          <option value="true" {% if selected.only_dubbed %}selected{% endif %}>Solo doblados</option>
+          <option value="false" {% if not selected.only_dubbed %}selected{% endif %}>Mostrar también sin doblaje</option>
+        </select>
+      </label>
+      <button class="primary" type="submit">Aplicar</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Resultados ({{ items|length }})</h2>
+    {% if items %}
+      <div class="catalog-grid">
+        {% for item in items %}
+          <article class="video-card">
+            {% if item.thumbnail_url %}
+              <img src="{{ item.thumbnail_url }}" alt="{{ item.title }}">
+            {% endif %}
+            <div>
+              <h3><a href="https://www.youtube.com/watch?v={{ item.video_id }}" target="_blank" rel="noreferrer">{{ item.title }}</a></h3>
+              <p>{{ item.channel or "Canal desconocido" }}</p>
+              <p class="muted">Audio: {{ item.audio_languages|join(", ") if item.audio_languages else "sin datos" }}</p>
+              <p class="muted">Visto: {{ item.last_seen_at }}</p>
+              <p class="muted">Fuentes: {{ item.source_labels or "-" }}</p>
+              {% if item.inspect_status == "failed" %}
+                <p class="error-text">Último error: {{ item.inspect_error }}</p>
+              {% endif %}
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p>No hay resultados con esos filtros.</p>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard · Dub Indexer{% endblock %}
+
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">MVP local</p>
+      <h2>Índice propio, no feed filtrado</h2>
+      <p>Descubre candidatos desde canales y búsquedas, verifica los idiomas de audio y guarda los resultados en SQLite.</p>
+    </div>
+    <form action="/runs/run-all" method="post">
+      <button class="primary" type="submit" {% if not diagnostics.ok %}disabled{% endif %}>Run all</button>
+    </form>
+  </section>
+
+  <section class="grid three">
+    <article class="card metric">
+      <span>Fuentes activas</span>
+      <strong>{{ stats.active_sources }}</strong>
+    </article>
+    <article class="card metric">
+      <span>Videos indexados</span>
+      <strong>{{ stats.total_videos }}</strong>
+    </article>
+    <article class="card metric">
+      <span>Con doblaje</span>
+      <strong>{{ stats.dubbed_videos }}</strong>
+    </article>
+  </section>
+
+  <section class="grid two">
+    <article class="card">
+      <h3>Último run</h3>
+      {% if stats.latest_run %}
+        <dl class="kv">
+          <div><dt>ID</dt><dd>#{{ stats.latest_run.id }}</dd></div>
+          <div><dt>Status</dt><dd>{{ stats.latest_run.status }}</dd></div>
+          <div><dt>Candidatos</dt><dd>{{ stats.latest_run.candidates_found }}</dd></div>
+          <div><dt>Inspeccionados</dt><dd>{{ stats.latest_run.videos_checked }}</dd></div>
+          <div><dt>Con doblaje</dt><dd>{{ stats.latest_run.dubbed_found }}</dd></div>
+        </dl>
+      {% else %}
+        <p>Todavía no hay runs.</p>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h3>Checks de entorno</h3>
+      <dl class="kv">
+        <div><dt>Node</dt><dd>{{ "OK" if diagnostics.node_ok else "Falta" }}</dd></div>
+        <div><dt>yt-dlp</dt><dd>{{ "OK" if diagnostics.ytdlp_ok else "Error" }}</dd></div>
+        <div><dt>App</dt><dd><a href="http://{{ settings.host }}:{{ settings.port }}">http://{{ settings.host }}:{{ settings.port }}</a></dd></div>
+      </dl>
+    </article>
+  </section>
+
+  <section class="card">
+    <h3>Runs recientes</h3>
+    {% if runs %}
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Scope</th>
+            <th>Status</th>
+            <th>Candidatos</th>
+            <th>Con doblaje</th>
+            <th>Inicio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in runs %}
+            <tr>
+              <td>#{{ run.id }}</td>
+              <td>{{ run.scope }}</td>
+              <td>{{ run.status }}</td>
+              <td>{{ run.candidates_found }}</td>
+              <td>{{ run.dubbed_found }}</td>
+              <td>{{ run.started_at }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No hay runs todavía.</p>
+    {% endif %}
+  </section>
+{% endblock %}
