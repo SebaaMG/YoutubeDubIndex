@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import tempfile
 import unittest
 from datetime import datetime
@@ -37,6 +38,32 @@ class FakeRunner:
             run_id = len(self.calls)
         self._active_run_id = run_id
         return run_id
+
+
+class FakeDiscoveryWorker:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def run_manual_feed_batch(
+        self,
+        *,
+        candidate_limit: int = 50,
+        max_seed_discoveries: int | None = None,
+    ) -> dict[str, int]:
+        self.calls.append(
+            {
+                "candidate_limit": candidate_limit,
+                "max_seed_discoveries": max_seed_discoveries,
+            }
+        )
+        return {
+            "seeds": 1,
+            "related_candidates": 60,
+            "inspected": candidate_limit,
+            "verified": 12,
+            "rejected": candidate_limit - 12,
+            "failed": 0,
+        }
 
 
 class CatalogUiTests(unittest.TestCase):
@@ -85,6 +112,7 @@ class CatalogUiTests(unittest.TestCase):
             runner=self.runner,
             diagnostics=StartupDiagnostics(node_ok=True, ytdlp_ok=True, messages=[]),
         )
+        self.services = services
         self.controller = AppController(services)
         self.window = MainWindow(self.controller, services)
 
@@ -249,6 +277,25 @@ class CatalogUiTests(unittest.TestCase):
         self.assertEqual([item["video_id"] for item in self.window._catalog_rows], ["abc123"])
         self.assertEqual(self.window.catalog_model.rowCount(), 1)
         self.assertEqual(self.window.catalog_results_count.text(), "1 encontrados")
+
+    def test_manual_feed_button_runs_fifty_candidate_expansion(self) -> None:
+        worker = FakeDiscoveryWorker()
+        self.services.discovery_worker = worker  # type: ignore[assignment]
+        self.window.switch_page("catalog")
+        self.window.show()
+        self.app.processEvents()
+
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 50")
+        self.window.catalog_manual_discovery_button.click()
+        for _ in range(100):
+            self.app.processEvents()
+            if worker.calls and self.window.catalog_manual_discovery_button.isEnabled():
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(worker.calls, [{"candidate_limit": 50, "max_seed_discoveries": 10}])
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 50")
+        self.assertTrue(self.window.catalog_manual_discovery_button.isEnabled())
 
     def test_catalog_year_controls_offer_scrollable_youtube_year_range(self) -> None:
         self.window.switch_page("catalog")

@@ -67,6 +67,38 @@ class FakeYouTubeService:
         )
 
 
+class FeedBatchYouTubeService(FakeYouTubeService):
+    def discover_related(self, video_id: str) -> list[dict[str, Any]]:
+        self.related_calls.append(video_id)
+        return [
+            {
+                "video_id": f"feed{i:02d}",
+                "title": f"Feed candidate {i}",
+                "channel": "Feed Channel",
+                "channel_id": "feedchan",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100 + i,
+            }
+            for i in range(60)
+        ]
+
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en", "es-US"],
+            original_audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title=video_id,
+            channel="Feed Channel",
+            channel_id="feedchan",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
 class DiscoveryWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -109,6 +141,34 @@ class DiscoveryWorkerTests(unittest.TestCase):
         self.assertEqual(frontier["plain1"], "rejected")
         seeds = {(row["source_type"], row["value"]) for row in self.repo.list_discovery_seeds()}
         self.assertIn(("video", "dubbed1"), seeds)
+
+    def test_manual_feed_batch_checks_fifty_related_candidates_per_click(self) -> None:
+        youtube = FeedBatchYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        self.repo.create_discovery_seed(
+            seed_kind="starter_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=80,
+        )
+
+        summary = worker.run_manual_feed_batch(candidate_limit=50, max_seed_discoveries=1)
+
+        self.assertEqual(youtube.related_calls, ["seed123"])
+        self.assertEqual(len(youtube.inspect_calls), 50)
+        self.assertEqual(summary["related_candidates"], 60)
+        self.assertEqual(summary["inspected"], 50)
+        self.assertEqual(summary["verified"], 50)
+        catalog = self.repo.list_catalog_page(
+            lang="__spanish__",
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+            page_size=100,
+        )
+        self.assertEqual(len(catalog["items"]), 50)
 
 
 if __name__ == "__main__":

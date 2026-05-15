@@ -1526,6 +1526,7 @@ class SourceSpinBox(QSpinBox):
 class MainWindow(QMainWindow):
     catalogCountReady = Signal(int, int)
     catalogFiltersReady = Signal(int, dict)
+    manualDiscoveryReady = Signal(dict)
 
     def __init__(self, controller: AppController, services: DesktopServices) -> None:
         super().__init__()
@@ -1553,6 +1554,8 @@ class MainWindow(QMainWindow):
         self._catalog_filters_generation = 0
         self._catalog_filters_loading = False
         self._catalog_filter_threads: list[threading.Thread] = []
+        self._manual_discovery_threads: list[threading.Thread] = []
+        self._manual_discovery_running = False
         self._catalog_render_token = 0
         self._catalog_row_stretch_index: int | None = None
         self._catalog_layout_signature: tuple[Any, ...] | None = None
@@ -1565,8 +1568,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(services.settings.app_title or " ")
         self.catalogCountReady.connect(self.handle_catalog_count_ready)
         self.catalogFiltersReady.connect(self.handle_catalog_filters_ready)
+        self.manualDiscoveryReady.connect(self.handle_manual_discovery_ready)
         self.resize(1680, 980)
-        self.setStatusBar(QStatusBar())
+        status_bar = QStatusBar()
+        status_bar.setSizeGripEnabled(False)
+        status_bar.hide()
+        self.setStatusBar(status_bar)
 
         thumb_cache_dir = self.services.settings.data_dir / "thumb_cache_v1"
         thumb_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -2119,7 +2126,7 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         tab.setObjectName("pageRoot")
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(34, 16, 34, 14)
+        layout.setContentsMargins(8, 12, 8, 0)
         layout.setSpacing(8)
 
         # ── Catalog header ───────────────────────────────────
@@ -2242,6 +2249,13 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.catalog_query, 3)
         controls_layout.addWidget(self.catalog_lang, 1)
         controls_layout.addWidget(self.catalog_sort)
+        self.catalog_manual_discovery_button = QPushButton("Explorar 50")
+        self.catalog_manual_discovery_button.setProperty("role", "ghost")
+        self.catalog_manual_discovery_button.setProperty("compactCatalog", "true")
+        self.catalog_manual_discovery_button.setMinimumHeight(36)
+        self.catalog_manual_discovery_button.setMaximumHeight(36)
+        self.catalog_manual_discovery_button.clicked.connect(self.handle_manual_feed_expansion)
+        controls_layout.addWidget(self.catalog_manual_discovery_button)
         self.catalog_filters_toggle = QPushButton("Mas filtros")
         self.catalog_filters_toggle.setProperty("role", "ghost")
         self.catalog_filters_toggle.setProperty("compactCatalog", "true")
@@ -2609,6 +2623,55 @@ class MainWindow(QMainWindow):
             widget.blockSignals(False)
 
         self.refresh_catalog()
+
+    def handle_manual_feed_expansion(self, *_args: object) -> None:
+        if self._manual_discovery_running:
+            return
+        self._manual_discovery_running = True
+        self.catalog_manual_discovery_button.setEnabled(False)
+        self.catalog_manual_discovery_button.setText("Explorando...")
+        self.statusBar().showMessage("Explorando 50 videos recomendados", 4000)
+
+        def worker() -> None:
+            payload: dict[str, Any]
+            try:
+                payload = {"summary": self.controller.run_manual_feed_expansion(candidate_limit=50)}
+            except Exception as exc:
+                payload = {"error": humanize_exception(exc)}
+            self.manualDiscoveryReady.emit(payload)
+
+        self._manual_discovery_threads = [
+            thread for thread in self._manual_discovery_threads if thread.is_alive()
+        ]
+        thread = threading.Thread(target=worker, daemon=True, name="manual-feed-expansion")
+        self._manual_discovery_threads.append(thread)
+        thread.start()
+
+    def handle_manual_discovery_ready(self, payload: dict[str, Any]) -> None:
+        self._manual_discovery_threads = [
+            thread for thread in self._manual_discovery_threads if thread.is_alive()
+        ]
+        self._manual_discovery_running = False
+        self.catalog_manual_discovery_button.setEnabled(True)
+        self.catalog_manual_discovery_button.setText("Explorar 50")
+        error = payload.get("error")
+        if error:
+            self.statusBar().showMessage(str(error), 6000)
+            return
+
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        inspected = int(summary.get("inspected") or 0)
+        verified = int(summary.get("verified") or 0)
+        related = int(summary.get("related_candidates") or 0)
+        self.statusBar().showMessage(
+            f"Exploracion lista: {inspected} revisados, {verified} publicados, {related} candidatos",
+            6000,
+        )
+        self.refresh_catalog_filters()
+        self.refresh_catalog()
+        self.refresh_dashboard()
 
     def toggle_dashboard_more_info(self, *_args: object) -> None:
         visible = not self.dashboard_more_info.isVisible()
@@ -3551,6 +3614,10 @@ class MainWindow(QMainWindow):
             if thread.is_alive():
                 thread.join(timeout=2.0)
         self._catalog_filter_threads = [thread for thread in self._catalog_filter_threads if thread.is_alive()]
+        for thread in list(self._manual_discovery_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._manual_discovery_threads = [thread for thread in self._manual_discovery_threads if thread.is_alive()]
         super().closeEvent(event)
 
     def show_error(self, title: str, error: Exception) -> None:

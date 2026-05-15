@@ -28,7 +28,7 @@ class Settings:
     discovery_inspect_batch: int = 12
     discovery_seed_candidate_limit: int = 50
     discovery_loop_interval_seconds: int = 45
-    starter_pack_version: str = "v2"
+    starter_pack_version: str = "v3"
 
     @property
     def runtime_root(self) -> Path:

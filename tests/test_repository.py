@@ -449,6 +449,175 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertIn("zRtGL0-5rg4", missing)
 
+    def test_catalog_hides_dubbed_video_until_display_metadata_is_repaired(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo(
+                "82Zi7ZrHeY8",
+                "82Zi7ZrHeY8",
+                "I Tried Exotic Food On Facebook Marketplace!",
+                None,
+                None,
+                None,
+                source_id,
+                to_iso(),
+            )
+        )
+        self.repo.store_inspection_result(
+            "82Zi7ZrHeY8",
+            audio_languages=["en", "es"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={"source": "inspection", "original_audio_languages": ["en"]},
+            title="82Zi7ZrHeY8",
+            channel="I Tried Exotic Food On Facebook Marketplace!",
+            published_at="2026-05-14",
+            view_count=100,
+        )
+
+        catalog = self.repo.list_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+        )
+
+        self.assertEqual(catalog, [])
+
+    def test_any_youtube_id_like_title_is_incomplete_even_if_not_current_video_id(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo("abc123def45", "Placeholder", "Real Channel", "chan1", 100, None, source_id, to_iso())
+        )
+        self.repo.store_inspection_result(
+            "abc123def45",
+            audio_languages=["en", "es"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={"source": "inspection", "original_audio_languages": ["en"]},
+            title="ZZZyyyXXX11",
+            channel="Real Channel",
+            published_at="2026-05-14",
+            view_count=100,
+        )
+
+        with self.repo.db.connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_complete FROM videos WHERE video_id = ?",
+                ("abc123def45",),
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["metadata_complete"], 0)
+
+    def test_inspection_repairs_frontier_metadata_placeholders(self) -> None:
+        self.repo.enqueue_candidate(
+            {
+                "video_id": "82Zi7ZrHeY8",
+                "title": "82Zi7ZrHeY8",
+                "channel": "I Tried Exotic Food On Facebook Marketplace!",
+            },
+            priority=90,
+        )
+
+        self.repo.store_inspection_result(
+            "82Zi7ZrHeY8",
+            audio_languages=["en", "es"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={"source": "inspection", "original_audio_languages": ["en"]},
+            title="I Tried Exotic Food On Facebook Marketplace!",
+            channel="Nick Kratka",
+            channel_id="UCRPNk3TA5cbyB-8hvNgsP5g",
+            published_at="2026-05-14",
+            view_count=100,
+        )
+
+        with self.repo.db.connect() as conn:
+            row = conn.execute(
+                "SELECT title, channel, channel_id FROM candidate_frontier WHERE video_id = ?",
+                ("82Zi7ZrHeY8",),
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["title"], "I Tried Exotic Food On Facebook Marketplace!")
+        self.assertEqual(row["channel"], "Nick Kratka")
+        self.assertEqual(row["channel_id"], "UCRPNk3TA5cbyB-8hvNgsP5g")
+
+    def test_startup_repair_demotes_legacy_display_metadata_placeholders(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo("ezmTq7I5Vf8", "Good title", "Real Channel", "chan1", 100, None, source_id, to_iso())
+        )
+        self.repo.store_inspection_result(
+            "ezmTq7I5Vf8",
+            audio_languages=["en", "es"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={"source": "inspection", "original_audio_languages": ["en"]},
+            title="Good title",
+            channel="Real Channel",
+            published_at="2026-05-14",
+            view_count=100,
+        )
+        with self.repo.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE videos
+                SET title = video_id, channel = 'Real Channel', metadata_complete = 1
+                WHERE video_id = 'ezmTq7I5Vf8'
+                """
+            )
+
+        repaired = self.repo.repair_display_metadata_flags()
+
+        with self.repo.db.connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_complete FROM videos WHERE video_id = 'ezmTq7I5Vf8'"
+            ).fetchone()
+        self.assertEqual(repaired, 1)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["metadata_complete"], 0)
+
+    def test_catalog_defensively_hides_stale_complete_flag_with_id_title(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo("HH2gKrl22Fw", "Good title", "Aquarium Info", "chan1", 100, None, source_id, to_iso())
+        )
+        self.repo.store_inspection_result(
+            "HH2gKrl22Fw",
+            audio_languages=["en-US", "es"],
+            has_dubbing=True,
+            dub_kind="manual",
+            dub_evidence={"source": "inspection", "original_audio_languages": ["en-US"]},
+            title="Good title",
+            channel="Aquarium Info",
+            published_at="2026-04-18",
+            view_count=100,
+        )
+        with self.repo.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE videos
+                SET title = video_id, metadata_complete = 1
+                WHERE video_id = 'HH2gKrl22Fw'
+                """
+            )
+
+        catalog = self.repo.list_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+        )
+
+        self.assertEqual(catalog, [])
+
     def test_candidate_upsert_does_not_overwrite_repaired_metadata_with_placeholders(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
         self.repo.upsert_candidate(CandidateVideo("zRtGL0-5rg4", "Good", "MrBeast", "chan1", 100, None, source_id, to_iso()))

@@ -20,6 +20,8 @@ class DiscoveryWorker:
         *,
         max_seed_discoveries: int | None = None,
         max_candidate_inspections: int | None = None,
+        randomize_seeds: bool = False,
+        seed_rescan_delay_minutes: int = 240,
     ) -> dict[str, int]:
         seed_limit = int(max_seed_discoveries or getattr(self.settings, "discovery_seed_batch", 2))
         inspect_limit = int(max_candidate_inspections or getattr(self.settings, "discovery_inspect_batch", 12))
@@ -32,7 +34,7 @@ class DiscoveryWorker:
             "failed": 0,
         }
 
-        for seed in self.repo.claim_discovery_seeds(limit=seed_limit):
+        for seed in self.repo.claim_discovery_seeds(limit=seed_limit, randomize=randomize_seeds):
             summary["seeds"] += 1
             try:
                 candidates = self._discover_seed(seed)
@@ -49,7 +51,7 @@ class DiscoveryWorker:
                     score=1.0,
                 )
             summary["related_candidates"] += len(candidates)
-            self.repo.mark_discovery_seed_scanned(int(seed["id"]))
+            self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=seed_rescan_delay_minutes)
 
         for candidate in self.repo.claim_frontier_candidates(limit=inspect_limit):
             video_id = str(candidate["video_id"])
@@ -98,6 +100,21 @@ class DiscoveryWorker:
             summary["verified"] += 1
 
         return summary
+
+    def run_manual_feed_batch(
+        self,
+        *,
+        candidate_limit: int = 50,
+        max_seed_discoveries: int | None = None,
+    ) -> dict[str, int]:
+        safe_limit = max(1, min(200, int(candidate_limit)))
+        seed_limit = int(max_seed_discoveries or max(1, min(10, (safe_limit + 9) // 10)))
+        return self.run_once(
+            max_seed_discoveries=seed_limit,
+            max_candidate_inspections=safe_limit,
+            randomize_seeds=True,
+            seed_rescan_delay_minutes=15,
+        )
 
     def _discover_seed(self, seed: dict[str, Any]) -> list[dict[str, Any]]:
         source_type = str(seed["source_type"])

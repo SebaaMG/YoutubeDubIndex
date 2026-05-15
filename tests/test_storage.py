@@ -2,13 +2,39 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+from app.config import get_settings
 from app.desktop_services import prepare_runtime_storage
 
 
 class StorageTests(unittest.TestCase):
+    def test_starter_pack_contains_strict_spanish_dub_evidence(self) -> None:
+        starter_path = get_settings().starter_pack_path
+        self.assertTrue(starter_path.exists())
+
+        with sqlite3.connect(starter_path) as conn:
+            track_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(video_audio_tracks)")
+            }
+            self.assertIn("is_original_audio", track_columns)
+
+            strict_spanish_count = conn.execute(
+                """
+                SELECT COUNT(DISTINCT v.video_id)
+                FROM videos v
+                JOIN video_audio_tracks t ON t.video_id = v.video_id
+                WHERE v.has_dubbing = 1
+                  AND v.published_at IS NOT NULL
+                  AND LOWER(t.language_code) LIKE 'es%'
+                  AND t.is_original_audio = 0
+                """
+            ).fetchone()[0]
+
+        self.assertGreaterEqual(strict_spanish_count, 100)
+
     def test_prepare_runtime_storage_migrates_legacy_bundle_data_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

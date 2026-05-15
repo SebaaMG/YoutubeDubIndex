@@ -55,13 +55,13 @@ def looks_like_video_id(value: str | None) -> bool:
 
 def valid_video_title(video_id: str, title: str | None) -> bool:
     text = str(title or "").strip()
-    return bool(text and text != video_id and not looks_like_video_id(text))
+    return bool(text and not looks_like_video_id(text))
 
 
 def valid_channel_name(video_id: str, title: str | None, channel: str | None) -> bool:
     text = str(channel or "").strip()
     title_text = str(title or "").strip()
-    if not text or text == video_id or looks_like_video_id(text):
+    if not text or text == video_id:
         return False
     if title_text and text == title_text:
         return False
@@ -83,6 +83,24 @@ def metadata_values_complete(
         and valid_channel_name(video_id, title, channel)
         else 0
     )
+
+
+def sanitize_inspection_metadata(
+    video_id: str,
+    title: str | None,
+    channel: str | None,
+    channel_id: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    title_text = str(title or "").strip()
+    safe_title = title_text if valid_video_title(video_id, title_text) else None
+    title_was_rejected = bool(title_text and safe_title is None)
+
+    channel_text = str(channel or "").strip()
+    safe_channel = None
+    if not title_was_rejected and valid_channel_name(video_id, safe_title, channel_text):
+        safe_channel = channel_text
+    safe_channel_id = str(channel_id or "").strip() if safe_channel and str(channel_id or "").strip() else None
+    return safe_title, safe_channel, safe_channel_id
 
 
 def encode_cursor(payload: dict[str, Any] | None) -> str | None:
@@ -227,6 +245,31 @@ class Repository:
         conn.execute(
             "INSERT INTO video_search(rowid, video_id, title, channel) VALUES (?, ?, ?, ?)",
             (row["rowid"], row["video_id"], row["title"], row["channel"]),
+        )
+
+    def _refresh_video_metadata_complete(self, conn: Any, video_id: str) -> None:
+        row = conn.execute(
+            """
+            SELECT video_id, title, channel, published_at, view_count
+            FROM videos
+            WHERE video_id = ?
+            """,
+            (video_id,),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            "UPDATE videos SET metadata_complete = ? WHERE video_id = ?",
+            (
+                metadata_values_complete(
+                    str(row["video_id"]),
+                    row["title"],
+                    row["channel"],
+                    row["published_at"],
+                    row["view_count"],
+                ),
+                video_id,
+            ),
         )
 
     def _replace_audio_tracks(
@@ -586,6 +629,39 @@ class Repository:
                 (key, value),
             )
 
+    def repair_display_metadata_flags(self, *, version: str = "v1") -> int:
+        preference_key = f"display_metadata_repair:{version}"
+        if self.get_preference(preference_key) == "1":
+            return 0
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE videos
+                SET metadata_complete = 0
+                WHERE metadata_complete = 1
+                  AND (
+                    (
+                      LENGTH(TRIM(COALESCE(title, ''))) = 11
+                      AND TRIM(COALESCE(title, '')) NOT GLOB '*[^A-Za-z0-9_-]*'
+                    )
+                    OR (
+                      TRIM(COALESCE(title, '')) != ''
+                      AND TRIM(COALESCE(channel, '')) = TRIM(COALESCE(title, ''))
+                    )
+                  )
+                """
+            )
+            repaired = int(cursor.rowcount or 0)
+            conn.execute(
+                """
+                INSERT INTO app_preferences (key, value)
+                VALUES (?, '1')
+                ON CONFLICT(key) DO UPDATE SET value = '1'
+                """,
+                (preference_key,),
+            )
+            return repaired
+
     def create_discovery_seed(
         self,
         *,
@@ -638,17 +714,18 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_discovery_seeds(self, *, limit: int = 1) -> list[dict[str, Any]]:
+    def claim_discovery_seeds(self, *, limit: int = 1, randomize: bool = False) -> list[dict[str, Any]]:
         timestamp = to_iso()
         safe_limit = max(1, min(50, int(limit)))
+        order_by = "RANDOM()" if randomize else "priority ASC, COALESCE(next_discovery_at, created_at) ASC, id ASC"
         with self.db.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM discovery_seeds
                 WHERE enabled = 1
                   AND (next_discovery_at IS NULL OR next_discovery_at <= ?)
-                ORDER BY priority ASC, COALESCE(next_discovery_at, created_at) ASC, id ASC
+                ORDER BY {order_by}
                 LIMIT ?
                 """,
                 (timestamp, safe_limit),
@@ -1484,6 +1561,13 @@ class Repository:
         if confidence not in {"high", "medium", "low"}:
             confidence = "high" if safe_dub_kind in {"none", "automatic"} else "low"
         evidence_json = json.dumps(evidence_dict)
+        safe_title, safe_channel, safe_channel_id = sanitize_inspection_metadata(
+            video_id,
+            title,
+            channel,
+            channel_id,
+        )
+        checked_at = to_iso()
         with self.db.connect() as conn:
             conn.execute(
                 """
@@ -1532,9 +1616,9 @@ class Repository:
                     confidence,
                     evidence_json,
                     int(classifier_version),
-                    title,
-                    channel,
-                    channel_id,
+                    safe_title,
+                    safe_channel,
+                    safe_channel_id,
                     duration_seconds,
                     thumbnail_url,
                     published_at,
@@ -1546,14 +1630,39 @@ class Repository:
                     published_at,
                     published_at,
                     view_count,
-                    title,
-                    channel,
-                    channel,
-                    channel,
-                    title,
-                    channel,
-                    to_iso(),
-                    to_iso(),
+                    safe_title,
+                    safe_channel,
+                    safe_channel,
+                    safe_channel,
+                    safe_title,
+                    safe_channel,
+                    checked_at,
+                    checked_at,
+                    video_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE candidate_frontier
+                SET title = COALESCE(NULLIF(?, ''), title),
+                    channel = COALESCE(NULLIF(?, ''), channel),
+                    channel_id = COALESCE(NULLIF(?, ''), channel_id),
+                    duration_seconds = COALESCE(?, duration_seconds),
+                    thumbnail_url = COALESCE(NULLIF(?, ''), thumbnail_url),
+                    published_at = COALESCE(?, published_at),
+                    view_count = COALESCE(?, view_count),
+                    updated_at = ?
+                WHERE video_id = ?
+                """,
+                (
+                    safe_title,
+                    safe_channel,
+                    safe_channel_id,
+                    duration_seconds,
+                    thumbnail_url,
+                    published_at,
+                    view_count,
+                    checked_at,
                     video_id,
                 ),
             )
@@ -1566,6 +1675,7 @@ class Repository:
                 original_audio_languages=original_audio_languages,
                 evidence_source=str(evidence_dict.get("source") or "inspection"),
             )
+            self._refresh_video_metadata_complete(conn, video_id)
             self._sync_video_search(conn, video_id)
 
     def store_inspection_failure(self, video_id: str, error: str) -> None:
@@ -1626,6 +1736,12 @@ class Repository:
                 if confidence not in {"high", "medium", "low"}:
                     confidence = "high" if safe_dub_kind in {"none", "automatic"} else "low"
                 evidence_json = json.dumps(evidence_dict)
+                safe_title, safe_channel, safe_channel_id = sanitize_inspection_metadata(
+                    video_id,
+                    title,
+                    channel,
+                    channel_id,
+                )
                 checked_at = to_iso()
                 conn.execute(
                     """
@@ -1674,9 +1790,9 @@ class Repository:
                         confidence,
                         evidence_json,
                         classifier_version,
-                        title,
-                        channel,
-                        channel_id,
+                        safe_title,
+                        safe_channel,
+                        safe_channel_id,
                         duration_seconds,
                         thumbnail_url,
                         published_at,
@@ -1688,13 +1804,38 @@ class Repository:
                         published_at,
                         published_at,
                         view_count,
-                        title,
-                        channel,
-                        channel,
-                        channel,
-                        title,
-                        channel,
+                        safe_title,
+                        safe_channel,
+                        safe_channel,
+                        safe_channel,
+                        safe_title,
+                        safe_channel,
                         checked_at,
+                        checked_at,
+                        video_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE candidate_frontier
+                    SET title = COALESCE(NULLIF(?, ''), title),
+                        channel = COALESCE(NULLIF(?, ''), channel),
+                        channel_id = COALESCE(NULLIF(?, ''), channel_id),
+                        duration_seconds = COALESCE(?, duration_seconds),
+                        thumbnail_url = COALESCE(NULLIF(?, ''), thumbnail_url),
+                        published_at = COALESCE(?, published_at),
+                        view_count = COALESCE(?, view_count),
+                        updated_at = ?
+                    WHERE video_id = ?
+                    """,
+                    (
+                        safe_title,
+                        safe_channel,
+                        safe_channel_id,
+                        duration_seconds,
+                        thumbnail_url,
+                        published_at,
+                        view_count,
                         checked_at,
                         video_id,
                     ),
@@ -1708,6 +1849,7 @@ class Repository:
                     original_audio_languages=original_audio_languages,
                     evidence_source=str(evidence_dict.get("source") or "inspection"),
                 )
+                self._refresh_video_metadata_complete(conn, video_id)
                 self._sync_video_search(conn, video_id)
 
     def store_inspection_failures_batch(self, failures: list[tuple[str, str]]) -> None:
@@ -1771,7 +1913,16 @@ class Repository:
         year_before: int | None = None,
         query_mode: str = "legacy",
     ) -> tuple[list[str], list[Any]]:
-        clauses = ["v.catalog_visible = 1", "v.published_at IS NOT NULL", "v.published_at != ''"]
+        clauses = [
+            "v.catalog_visible = 1",
+            "v.metadata_complete = 1",
+            "NOT (LENGTH(TRIM(COALESCE(v.title, ''))) = 11 "
+            "AND TRIM(COALESCE(v.title, '')) NOT GLOB '*[^A-Za-z0-9_-]*')",
+            "NOT (TRIM(COALESCE(v.title, '')) != '' "
+            "AND TRIM(COALESCE(v.channel, '')) = TRIM(COALESCE(v.title, '')))",
+            "v.published_at IS NOT NULL",
+            "v.published_at != ''",
+        ]
         params: list[Any] = []
 
         if only_dubbed:

@@ -46,6 +46,7 @@ def build_services() -> DesktopServices:
     db.initialize()
     repo = Repository(db)
     repo.merge_starter_pack(settings.starter_pack_path, version=settings.starter_pack_version)
+    repo.repair_display_metadata_flags()
     repo.recover_scheduler_jobs()
     youtube = YouTubeService(settings)
     diagnostics = youtube.startup_diagnostics()
@@ -148,10 +149,26 @@ class AppController:
     def list_discovery_seeds(self) -> list[dict[str, Any]]:
         return self.services.repo.list_discovery_seeds()
 
-    def run_discovery_once(self) -> dict[str, int]:
+    def run_discovery_once(
+        self,
+        *,
+        max_seed_discoveries: int | None = None,
+        max_candidate_inspections: int | None = None,
+    ) -> dict[str, int]:
         if self.services.discovery_worker is None:
             return {}
-        return self.services.discovery_worker.run_once()
+        return self.services.discovery_worker.run_once(
+            max_seed_discoveries=max_seed_discoveries,
+            max_candidate_inspections=max_candidate_inspections,
+        )
+
+    def run_manual_feed_expansion(self, *, candidate_limit: int = 50) -> dict[str, int]:
+        if self.services.discovery_worker is None:
+            return {}
+        return self.services.discovery_worker.run_manual_feed_batch(
+            candidate_limit=candidate_limit,
+            max_seed_discoveries=10,
+        )
 
     def update_source(
         self,
