@@ -1132,6 +1132,132 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(states["cand1"], "verified")
         self.assertEqual(states["cand2"], "rejected")
 
+    def test_frontier_claim_prioritizes_less_saturated_channels(self) -> None:
+        seed_id = self.repo.create_discovery_seed(
+            seed_kind="related_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=50,
+        )
+        for index in range(3):
+            self.repo.enqueue_candidate(
+                {
+                    "video_id": f"crowded{index}",
+                    "title": f"Crowded {index}",
+                    "channel": "Crowded Channel",
+                    "channel_id": "crowded",
+                },
+                source_seed_id=seed_id,
+                priority=20,
+                score=1.0,
+            )
+        self.repo.enqueue_candidate(
+            {
+                "video_id": "rare1",
+                "title": "Rare",
+                "channel": "Rare Channel",
+                "channel_id": "rare",
+            },
+            source_seed_id=seed_id,
+            priority=20,
+            score=1.0,
+        )
+
+        claimed = self.repo.claim_frontier_candidates(limit=1)
+
+        self.assertEqual([item["video_id"] for item in claimed], ["rare1"])
+
+    def test_frontier_claim_treats_missing_channel_as_unique(self) -> None:
+        for index in range(2):
+            self.repo.enqueue_candidate(
+                {
+                    "video_id": f"crowded{index}",
+                    "title": f"Crowded {index}",
+                    "channel": "Crowded Channel",
+                    "channel_id": "crowded",
+                },
+                priority=20,
+                score=1.0,
+            )
+        self.repo.enqueue_candidate({"video_id": "unknown1", "title": "Unknown 1"}, priority=20, score=1.0)
+        self.repo.enqueue_candidate({"video_id": "unknown2", "title": "Unknown 2"}, priority=20, score=1.0)
+
+        claimed = self.repo.claim_frontier_candidates(limit=2)
+
+        self.assertEqual({item["video_id"] for item in claimed}, {"unknown1", "unknown2"})
+
+    def test_discovery_seed_claim_prioritizes_less_saturated_video_channels(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        for index in range(3):
+            video_id = f"crowded_seed_{index}"
+            self.repo.upsert_candidate(
+                CandidateVideo(video_id, f"Crowded {index}", "Crowded Channel", "crowded", 100, None, source_id, to_iso())
+            )
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Crowded {index}",
+                value=video_id,
+                priority=80,
+            )
+        self.repo.upsert_candidate(
+            CandidateVideo("rare_seed", "Rare", "Rare Channel", "rare", 100, None, source_id, to_iso())
+        )
+        self.repo.create_discovery_seed(
+            seed_kind="related_video",
+            source_type="video",
+            label="Rare",
+            value="rare_seed",
+            priority=80,
+        )
+
+        claimed = self.repo.claim_discovery_seeds(limit=1, randomize=False)
+
+        self.assertEqual([item["value"] for item in claimed], ["rare_seed"])
+
+    def test_discovery_seed_claim_keeps_user_seeds_ahead_of_video_entropy(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        self.repo.upsert_candidate(
+            CandidateVideo("video_seed", "Video", "Video Channel", "video-channel", 100, None, source_id, to_iso())
+        )
+        self.repo.create_discovery_seed(
+            seed_kind="related_video",
+            source_type="video",
+            label="Video",
+            value="video_seed",
+            priority=50,
+        )
+        self.repo.create_discovery_seed(
+            seed_kind="user_search",
+            source_type="search",
+            label="User interest",
+            value="user interest",
+            priority=50,
+        )
+
+        claimed = self.repo.claim_discovery_seeds(limit=1, randomize=False)
+
+        self.assertEqual([item["seed_kind"] for item in claimed], ["user_search"])
+
+    def test_counts_video_discovery_seeds_for_channel(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        for index in range(2):
+            video_id = f"seed_{index}"
+            self.repo.upsert_candidate(
+                CandidateVideo(video_id, f"Seed {index}", "Seed Channel", "seed-channel", 100, None, source_id, to_iso())
+            )
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Seed {index}",
+                value=video_id,
+                priority=80,
+            )
+
+        self.assertEqual(self.repo.count_video_discovery_seeds_for_channel("seed-channel", "Seed Channel"), 2)
+        self.assertEqual(self.repo.count_video_discovery_seeds_for_channel("missing-channel", "Missing"), 0)
+
     def test_merge_starter_pack_deduplicates_videos_and_records_version(self) -> None:
         starter_path = Path(self.temp_dir.name) / "starter.db"
         starter_repo = Repository(Database(starter_path))

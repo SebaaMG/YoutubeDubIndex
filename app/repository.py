@@ -717,20 +717,76 @@ class Repository:
     def claim_discovery_seeds(self, *, limit: int = 1, randomize: bool = False) -> list[dict[str, Any]]:
         timestamp = to_iso()
         safe_limit = max(1, min(50, int(limit)))
-        order_by = "RANDOM()" if randomize else "priority ASC, COALESCE(next_discovery_at, created_at) ASC, id ASC"
+        tie_breaker = "RANDOM()" if randomize else "COALESCE(e.next_discovery_at, e.created_at) ASC, e.id ASC"
         with self.db.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT *
-                FROM discovery_seeds
-                WHERE enabled = 1
-                  AND (next_discovery_at IS NULL OR next_discovery_at <= ?)
-                ORDER BY {order_by}
+                WITH eligible AS (
+                    SELECT
+                        ds.*,
+                        CASE
+                            WHEN ds.source_type = 'video' THEN
+                                CASE
+                                    WHEN TRIM(COALESCE(v.channel_id, '')) != '' THEN 'id:' || TRIM(v.channel_id)
+                                    WHEN TRIM(COALESCE(v.channel, '')) != '' THEN 'name:' || LOWER(TRIM(v.channel))
+                                    ELSE 'seed:' || ds.value
+                                END
+                            ELSE NULL
+                        END AS seed_channel_key,
+                        CASE
+                            WHEN ds.seed_kind IN ('user_search', 'user_channel') THEN 0
+                            ELSE 1
+                        END AS seed_rank_group
+                    FROM discovery_seeds ds
+                    LEFT JOIN videos v ON ds.source_type = 'video' AND v.video_id = ds.value
+                    WHERE ds.enabled = 1
+                      AND (ds.next_discovery_at IS NULL OR ds.next_discovery_at <= ?)
+                ),
+                channel_counts AS (
+                    SELECT seed_channel_key, COUNT(*) AS seed_channel_count
+                    FROM eligible
+                    WHERE seed_channel_key IS NOT NULL
+                    GROUP BY seed_channel_key
+                )
+                SELECT e.*, COALESCE(channel_counts.seed_channel_count, 0) AS seed_channel_count
+                FROM eligible e
+                LEFT JOIN channel_counts ON channel_counts.seed_channel_key = e.seed_channel_key
+                ORDER BY
+                    e.priority ASC,
+                    e.seed_rank_group ASC,
+                    COALESCE(channel_counts.seed_channel_count, 0) ASC,
+                    {tie_breaker}
                 LIMIT ?
                 """,
                 (timestamp, safe_limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_video_discovery_seeds_for_channel(self, channel_id: str | None, channel: str | None) -> int:
+        cleaned_channel_id = str(channel_id or "").strip()
+        cleaned_channel = str(channel or "").strip()
+        if not cleaned_channel_id and not cleaned_channel:
+            return 0
+
+        if cleaned_channel_id:
+            clause = "TRIM(COALESCE(v.channel_id, '')) = ?"
+            params: tuple[Any, ...] = (cleaned_channel_id,)
+        else:
+            clause = "LOWER(TRIM(COALESCE(v.channel, ''))) = ?"
+            params = (cleaned_channel.lower(),)
+
+        with self.db.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM discovery_seeds ds
+                JOIN videos v ON ds.source_type = 'video' AND v.video_id = ds.value
+                WHERE ds.enabled = 1
+                  AND {clause}
+                """,
+                params,
+            ).fetchone()
+        return int(row[0] if row else 0)
 
     def mark_discovery_seed_scanned(self, seed_id: int, *, delay_minutes: int = 240) -> None:
         timestamp = to_iso()
@@ -885,10 +941,30 @@ class Repository:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT *
-                FROM candidate_frontier
-                WHERE state IN ('queued', 'failed') AND not_before <= ?
-                ORDER BY priority ASC, score DESC, updated_at ASC
+                WITH eligible AS (
+                    SELECT
+                        cf.*,
+                        CASE
+                            WHEN TRIM(COALESCE(cf.channel_id, '')) != '' THEN 'id:' || TRIM(cf.channel_id)
+                            WHEN TRIM(COALESCE(cf.channel, '')) != '' THEN 'name:' || LOWER(TRIM(cf.channel))
+                            ELSE 'video:' || cf.video_id
+                        END AS channel_key
+                    FROM candidate_frontier cf
+                    WHERE cf.state IN ('queued', 'failed') AND cf.not_before <= ?
+                ),
+                channel_counts AS (
+                    SELECT channel_key, COUNT(*) AS channel_active_count
+                    FROM eligible
+                    GROUP BY channel_key
+                )
+                SELECT e.*, channel_counts.channel_active_count
+                FROM eligible e
+                JOIN channel_counts ON channel_counts.channel_key = e.channel_key
+                ORDER BY
+                    e.priority ASC,
+                    channel_counts.channel_active_count ASC,
+                    e.score DESC,
+                    e.updated_at ASC
                 LIMIT ?
                 """,
                 (timestamp, safe_limit),

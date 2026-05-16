@@ -206,6 +206,7 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_claim ON scheduler_jobs(state, not
 CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_lease ON scheduler_jobs(state, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_discovery_seeds_next ON discovery_seeds(enabled, next_discovery_at, priority, id);
 CREATE INDEX IF NOT EXISTS idx_candidate_frontier_claim ON candidate_frontier(state, not_before, priority, score DESC, updated_at);
+CREATE INDEX IF NOT EXISTS idx_candidate_frontier_channel_claim ON candidate_frontier(state, not_before, channel_id, channel);
 CREATE INDEX IF NOT EXISTS idx_candidate_frontier_seed ON candidate_frontier(source_seed_id, state);
 CREATE INDEX IF NOT EXISTS idx_discovery_edges_to ON discovery_edges(to_video_id);
 CREATE INDEX IF NOT EXISTS idx_feed_state_promoted ON feed_state(promoted_at DESC);

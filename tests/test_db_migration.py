@@ -163,6 +163,18 @@ class DatabaseMigrationTests(unittest.TestCase):
 
             self.assertIn("is_original_audio", columns)
 
+    def test_initialize_creates_candidate_frontier_channel_claim_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "indexes.db"
+            db = Database(db_path)
+            db.initialize()
+
+            check = sqlite3.connect(db_path)
+            indexes = {row[1] for row in check.execute("PRAGMA index_list(candidate_frontier)").fetchall()}
+            check.close()
+
+            self.assertIn("idx_candidate_frontier_channel_claim", indexes)
+
 
 if __name__ == "__main__":
     unittest.main()

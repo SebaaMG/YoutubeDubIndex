@@ -8,7 +8,7 @@ from typing import Any
 from app.config import Settings
 from app.db import Database
 from app.discovery_worker import DiscoveryWorker
-from app.repository import Repository
+from app.repository import CandidateVideo, Repository, SourceInput, to_iso
 from app.youtube import InspectionResult
 
 
@@ -99,6 +99,37 @@ class FeedBatchYouTubeService(FakeYouTubeService):
         )
 
 
+class SaturatedSeedYouTubeService(FakeYouTubeService):
+    def discover_related(self, video_id: str) -> list[dict[str, Any]]:
+        self.related_calls.append(video_id)
+        return [
+            {
+                "video_id": "newdub",
+                "title": "New dubbed candidate",
+                "channel": "Crowded Channel",
+                "channel_id": "crowded",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100,
+            }
+        ]
+
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en", "es-US"],
+            original_audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title="New dubbed candidate",
+            channel="Crowded Channel",
+            channel_id="crowded",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
 class DiscoveryWorkerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -169,6 +200,76 @@ class DiscoveryWorkerTests(unittest.TestCase):
             page_size=100,
         )
         self.assertEqual(len(catalog["items"]), 50)
+
+    def test_verified_video_from_saturated_channel_gets_dampened_seed_priority(self) -> None:
+        youtube = SaturatedSeedYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        for index in range(3):
+            video_id = f"existing_seed_{index}"
+            self.repo.upsert_candidate(
+                CandidateVideo(
+                    video_id,
+                    f"Existing {index}",
+                    "Crowded Channel",
+                    "crowded",
+                    100,
+                    None,
+                    source_id,
+                    to_iso(),
+                )
+            )
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Existing {index}",
+                value=video_id,
+                priority=80,
+            )
+        self.repo.create_discovery_seed(
+            seed_kind="starter_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=10,
+        )
+
+        summary = worker.run_once(max_seed_discoveries=1, max_candidate_inspections=1)
+
+        seeds = {row["value"]: row for row in self.repo.list_discovery_seeds()}
+        self.assertEqual(summary["verified"], 1)
+        self.assertGreater(seeds["newdub"]["priority"], 80)
+
+    def test_verified_video_from_new_channel_keeps_base_seed_priority(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="related_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=10,
+        )
+
+        self.worker.run_once(max_seed_discoveries=1, max_candidate_inspections=1)
+
+        seeds = {row["value"]: row for row in self.repo.list_discovery_seeds()}
+        self.assertEqual(seeds["dubbed1"]["priority"], 80)
+
+    def test_run_once_reports_discovery_diversity_metrics(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="related_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=10,
+        )
+
+        summary = self.worker.run_once(max_seed_discoveries=1, max_candidate_inspections=5)
+
+        self.assertEqual(summary["seed_unique_channels"], 1)
+        self.assertEqual(summary["seed_top_channel_count"], 1)
+        self.assertEqual(summary["candidate_unique_channels"], 2)
+        self.assertEqual(summary["candidate_top_channel_count"], 1)
+        self.assertEqual(summary["candidate_top_channel_percent"], 50.0)
 
 
 if __name__ == "__main__":

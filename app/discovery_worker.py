@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from typing import Any
 
 from .config import Settings
@@ -32,9 +33,16 @@ class DiscoveryWorker:
             "verified": 0,
             "rejected": 0,
             "failed": 0,
+            "candidate_unique_channels": 0,
+            "candidate_top_channel_count": 0,
+            "candidate_top_channel_percent": 0.0,
+            "seed_unique_channels": 0,
+            "seed_top_channel_count": 0,
         }
 
-        for seed in self.repo.claim_discovery_seeds(limit=seed_limit, randomize=randomize_seeds):
+        claimed_seeds = self.repo.claim_discovery_seeds(limit=seed_limit, randomize=randomize_seeds)
+        self._apply_seed_metrics(summary, claimed_seeds)
+        for seed in claimed_seeds:
             summary["seeds"] += 1
             try:
                 candidates = self._discover_seed(seed)
@@ -53,7 +61,9 @@ class DiscoveryWorker:
             summary["related_candidates"] += len(candidates)
             self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=seed_rescan_delay_minutes)
 
-        for candidate in self.repo.claim_frontier_candidates(limit=inspect_limit):
+        claimed_candidates = self.repo.claim_frontier_candidates(limit=inspect_limit)
+        self._apply_candidate_metrics(summary, claimed_candidates)
+        for candidate in claimed_candidates:
             video_id = str(candidate["video_id"])
             summary["inspected"] += 1
             try:
@@ -90,16 +100,53 @@ class DiscoveryWorker:
                 classifier_version=getattr(self.settings, "dub_classifier_version", 6),
             )
             self.repo.mark_candidate_verified(video_id)
+            channel_id = result.channel_id or candidate.get("channel_id")
+            channel = result.channel or candidate.get("channel")
+            same_channel_seed_count = self.repo.count_video_discovery_seeds_for_channel(channel_id, channel)
+            seed_priority = 80 + min(50, same_channel_seed_count * 2)
             self.repo.create_discovery_seed(
                 seed_kind="related_video",
                 source_type="video",
                 label=result.title or str(candidate.get("title") or video_id),
                 value=video_id,
-                priority=80,
+                priority=min(130, seed_priority),
             )
             summary["verified"] += 1
 
         return summary
+
+    @staticmethod
+    def _row_channel_key(row: dict[str, Any]) -> str:
+        if row.get("channel_key"):
+            return str(row["channel_key"])
+        if row.get("seed_channel_key"):
+            return str(row["seed_channel_key"])
+        channel_id = str(row.get("channel_id") or "").strip()
+        if channel_id:
+            return f"id:{channel_id}"
+        channel = str(row.get("channel") or "").strip()
+        if channel:
+            return f"name:{channel.lower()}"
+        video_id = str(row.get("video_id") or row.get("value") or row.get("id") or "").strip()
+        return f"video:{video_id}" if video_id else "unknown"
+
+    @classmethod
+    def _channel_counts(cls, rows: list[dict[str, Any]]) -> Counter[str]:
+        return Counter(cls._row_channel_key(row) for row in rows)
+
+    @classmethod
+    def _apply_seed_metrics(cls, summary: dict[str, int | float], rows: list[dict[str, Any]]) -> None:
+        counts = cls._channel_counts(rows)
+        summary["seed_unique_channels"] = len(counts)
+        summary["seed_top_channel_count"] = max(counts.values(), default=0)
+
+    @classmethod
+    def _apply_candidate_metrics(cls, summary: dict[str, int | float], rows: list[dict[str, Any]]) -> None:
+        counts = cls._channel_counts(rows)
+        top_count = max(counts.values(), default=0)
+        summary["candidate_unique_channels"] = len(counts)
+        summary["candidate_top_channel_count"] = top_count
+        summary["candidate_top_channel_percent"] = round((top_count / len(rows)) * 100, 2) if rows else 0.0
 
     def run_manual_feed_batch(
         self,
