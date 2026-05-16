@@ -43,6 +43,7 @@ class FakeRunner:
 class FakeDiscoveryWorker:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.immediate_calls: list[dict[str, object]] = []
 
     def run_manual_feed_batch(
         self,
@@ -62,6 +63,17 @@ class FakeDiscoveryWorker:
             "inspected": candidate_limit,
             "verified": 12,
             "rejected": candidate_limit - 12,
+            "failed": 0,
+        }
+
+    def enqueue_immediate_seed_candidates(self, seed_id: int, *, candidate_limit: int = 150) -> dict[str, int]:
+        self.immediate_calls.append({"seed_id": seed_id, "candidate_limit": candidate_limit})
+        return {
+            "seeds": 1,
+            "related_candidates": candidate_limit,
+            "inspected": 0,
+            "verified": 0,
+            "rejected": 0,
             "failed": 0,
         }
 
@@ -489,6 +501,7 @@ class EmptyCatalogUiTests(unittest.TestCase):
             runner=self.runner,
             diagnostics=StartupDiagnostics(node_ok=True, ytdlp_ok=True, messages=[]),
         )
+        self.services = services
         self.controller = AppController(services)
         self.window = MainWindow(self.controller, services)
 
@@ -513,15 +526,22 @@ class EmptyCatalogUiTests(unittest.TestCase):
         self.assertEqual(self.window.pages.currentIndex(), self.window.page_index["catalog"])
 
     def test_quick_submit_creates_permanent_interest_without_requiring_sources_page(self) -> None:
+        worker = FakeDiscoveryWorker()
+        self.services.discovery_worker = worker  # type: ignore[assignment]
         self.window.switch_page("catalog")
         self.window.catalog_empty_input.setText("@kurzgesagt")
         self.window.handle_catalog_quick_submit()
-        self.app.processEvents()
+        for _ in range(100):
+            self.app.processEvents()
+            if worker.immediate_calls:
+                break
+            time.sleep(0.01)
 
         seeds = self.controller.list_discovery_seeds()
         self.assertEqual(len(seeds), 1)
         self.assertEqual(seeds[0]["source_type"], "channel")
         self.assertEqual(seeds[0]["value"], "https://www.youtube.com/@kurzgesagt/videos")
+        self.assertEqual(worker.immediate_calls, [{"seed_id": seeds[0]["id"], "candidate_limit": 150}])
         self.assertEqual(self.runner.calls, [])
         self.assertEqual(self.window.catalog_empty_stack.currentIndex(), 1)
 

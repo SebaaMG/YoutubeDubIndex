@@ -13,6 +13,9 @@ if vendor_node.exists():
 starter_pack = project_root / "resources" / "starter" / "dubindex_seed.db"
 if starter_pack.exists():
     datas.append((str(starter_pack), "resources/starter"))
+discovery_resources = project_root / "resources" / "discovery"
+if discovery_resources.exists():
+    datas.append((str(discovery_resources), "resources/discovery"))
 
 datas += collect_data_files("yt_dlp")
 hiddenimports = collect_submodules("yt_dlp")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -1239,6 +1240,115 @@ class RepositoryTests(unittest.TestCase):
         claimed = self.repo.claim_discovery_seeds(limit=1, randomize=False)
 
         self.assertEqual([item["seed_kind"] for item in claimed], ["user_search"])
+
+    def test_import_content_pool_creates_system_search_seeds_idempotently(self) -> None:
+        pool_path = Path(self.temp_dir.name) / "content_pool.json"
+        pool_path.write_text(
+            json.dumps(
+                {
+                    "version": "test-v1",
+                    "theme_queries": [
+                        {"query": "streamer controversy explained", "priority": 45},
+                        {"query": "internet mysteries explained", "priority": 50},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        first = self.repo.import_content_pool(pool_path, version="test-v1")
+        second = self.repo.import_content_pool(pool_path, version="test-v1")
+
+        self.assertEqual(first["imported"], 2)
+        self.assertEqual(second["imported"], 0)
+        seeds = self.repo.list_discovery_seeds()
+        self.assertEqual(len(seeds), 2)
+        self.assertEqual({seed["seed_kind"] for seed in seeds}, {"system_search"})
+        self.assertEqual({seed["source_type"] for seed in seeds}, {"search"})
+
+    def test_mixed_discovery_seed_claim_uses_seven_content_and_three_free_slots(self) -> None:
+        for index in range(8):
+            self.repo.create_discovery_seed(
+                seed_kind="system_search",
+                source_type="search",
+                label=f"Content {index}",
+                value=f"content {index}",
+                priority=50,
+            )
+        for index in range(5):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Free {index}",
+                value=f"free{index}",
+                priority=80,
+            )
+
+        claimed = self.repo.claim_discovery_seeds_mixed(limit=10, randomize=False)
+
+        kinds = [seed["seed_kind"] for seed in claimed]
+        self.assertEqual(len(claimed), 10)
+        self.assertEqual(kinds.count("system_search"), 7)
+        self.assertEqual(kinds.count("related_video"), 3)
+
+    def test_mixed_discovery_seed_claim_treats_user_inputs_as_content_pool(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="user_search",
+            source_type="search",
+            label="User search",
+            value="user search",
+            priority=10,
+        )
+        self.repo.create_discovery_seed(
+            seed_kind="user_channel",
+            source_type="channel",
+            label="User channel",
+            value="https://www.youtube.com/@demo/videos",
+            priority=10,
+        )
+        for index in range(3):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Free {index}",
+                value=f"free-user-{index}",
+                priority=80,
+            )
+
+        claimed = self.repo.claim_discovery_seeds_mixed(limit=5, randomize=False)
+
+        claimed_kinds = {seed["seed_kind"] for seed in claimed}
+        self.assertIn("user_search", claimed_kinds)
+        self.assertIn("user_channel", claimed_kinds)
+
+    def test_mixed_discovery_seed_claim_falls_back_to_available_pool(self) -> None:
+        for index in range(4):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Free {index}",
+                value=f"only-free-{index}",
+                priority=80,
+            )
+
+        only_free = self.repo.claim_discovery_seeds_mixed(limit=3, randomize=False)
+        self.assertEqual(len(only_free), 3)
+        self.assertEqual({seed["seed_kind"] for seed in only_free}, {"related_video"})
+
+        second_repo = Repository(Database(Path(self.temp_dir.name) / "second.db"))
+        second_repo.db.initialize()
+        for index in range(4):
+            second_repo.create_discovery_seed(
+                seed_kind="system_search",
+                source_type="search",
+                label=f"Content {index}",
+                value=f"only content {index}",
+                priority=50,
+            )
+
+        only_content = second_repo.claim_discovery_seeds_mixed(limit=3, randomize=False)
+        self.assertEqual(len(only_content), 3)
+        self.assertEqual({seed["seed_kind"] for seed in only_content}, {"system_search"})
 
     def test_counts_video_discovery_seeds_for_channel(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))

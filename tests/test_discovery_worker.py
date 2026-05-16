@@ -99,6 +99,85 @@ class FeedBatchYouTubeService(FakeYouTubeService):
         )
 
 
+class MixedSeedYouTubeService(FakeYouTubeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_calls: list[tuple[str, str, int]] = []
+
+    def discover_source(self, source: dict[str, Any]) -> list[dict[str, Any]]:
+        source_type = str(source["type"])
+        value = str(source["value"])
+        limit = int(source["max_candidates_per_run"])
+        self.source_calls.append((source_type, value, limit))
+        return [
+            {
+                "video_id": f"{source_type}_{value}_{index}".replace(" ", "_").replace("/", "_")[:40],
+                "title": f"{value} candidate {index}",
+                "channel": f"{value} Channel",
+                "channel_id": f"{value}-channel",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100,
+            }
+            for index in range(min(limit, 3))
+        ]
+
+    def discover_related(self, video_id: str) -> list[dict[str, Any]]:
+        self.related_calls.append(video_id)
+        return [
+            {
+                "video_id": f"related_{video_id}_{index}",
+                "title": f"Related {video_id} {index}",
+                "channel": "Related Channel",
+                "channel_id": "related",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100,
+            }
+            for index in range(2)
+        ]
+
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title=video_id,
+            channel="Inspected",
+            channel_id="inspected",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
+class ImmediateInterestYouTubeService(FakeYouTubeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_calls: list[tuple[str, str, int]] = []
+
+    def discover_source(self, source: dict[str, Any]) -> list[dict[str, Any]]:
+        source_type = str(source["type"])
+        value = str(source["value"])
+        limit = int(source["max_candidates_per_run"])
+        self.source_calls.append((source_type, value, limit))
+        return [
+            {
+                "video_id": f"interest{index:03d}",
+                "title": f"Interest candidate {index}",
+                "channel": "Interest Channel",
+                "channel_id": "interest-channel",
+                "duration_seconds": 900,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 1000 + index,
+            }
+            for index in range(limit)
+        ]
+
+
 class SaturatedSeedYouTubeService(FakeYouTubeService):
     def discover_related(self, video_id: str) -> list[dict[str, Any]]:
         self.related_calls.append(video_id)
@@ -200,6 +279,54 @@ class DiscoveryWorkerTests(unittest.TestCase):
             page_size=100,
         )
         self.assertEqual(len(catalog["items"]), 50)
+
+    def test_run_once_uses_mixed_content_and_free_seed_pools_without_scoring_candidates(self) -> None:
+        youtube = MixedSeedYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        for index in range(7):
+            self.repo.create_discovery_seed(
+                seed_kind="system_search",
+                source_type="search",
+                label=f"Content {index}",
+                value=f"content {index}",
+                priority=50,
+            )
+        for index in range(3):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Free {index}",
+                value=f"free{index}",
+                priority=80,
+            )
+
+        worker.run_once(max_seed_discoveries=10, max_candidate_inspections=1)
+
+        self.assertEqual(len(youtube.source_calls), 7)
+        self.assertEqual(len(youtube.related_calls), 3)
+        scores = {row["score"] for row in self.repo.list_frontier_candidates()}
+        self.assertEqual(scores, {1.0})
+
+    def test_immediate_interest_discovery_enqueues_150_candidates_without_inspection(self) -> None:
+        youtube = ImmediateInterestYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        seed_id = self.repo.create_discovery_seed(
+            seed_kind="user_search",
+            source_type="search",
+            label="Internet mystery",
+            value="internet mystery",
+            priority=10,
+        )
+
+        summary = worker.enqueue_immediate_seed_candidates(seed_id, candidate_limit=150)
+
+        self.assertEqual(youtube.source_calls, [("search", "internet mystery", 150)])
+        self.assertEqual(summary["related_candidates"], 150)
+        self.assertEqual(summary["inspected"], 0)
+        self.assertEqual(youtube.inspect_calls, [])
+        frontier = self.repo.list_frontier_candidates()
+        self.assertEqual(len(frontier), 150)
+        self.assertEqual({row["state"] for row in frontier}, {"queued"})
 
     def test_verified_video_from_saturated_channel_gets_dampened_seed_priority(self) -> None:
         youtube = SaturatedSeedYouTubeService()

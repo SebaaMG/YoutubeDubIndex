@@ -46,6 +46,7 @@ def build_services() -> DesktopServices:
     db.initialize()
     repo = Repository(db)
     repo.merge_starter_pack(settings.starter_pack_path, version=settings.starter_pack_version)
+    repo.import_content_pool(settings.content_pool_path, version=settings.content_pool_version)
     repo.repair_display_metadata_flags()
     repo.recover_scheduler_jobs()
     youtube = YouTubeService(settings)
@@ -145,6 +146,22 @@ class AppController:
             "label": label,
             "value": normalized_value,
         }
+
+    def run_interest_initial_discovery(
+        self,
+        seed_id: int,
+        *,
+        candidate_limit: int = 150,
+    ) -> dict[str, int]:
+        if self.services.discovery_worker is None:
+            return {}
+        summary = self.services.discovery_worker.enqueue_immediate_seed_candidates(
+            int(seed_id),
+            candidate_limit=candidate_limit,
+        )
+        if self.services.discovery_loop is not None:
+            self.services.discovery_loop.wake()
+        return summary
 
     def list_discovery_seeds(self) -> list[dict[str, Any]]:
         return self.services.repo.list_discovery_seeds()

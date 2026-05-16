@@ -1527,6 +1527,7 @@ class MainWindow(QMainWindow):
     catalogCountReady = Signal(int, int)
     catalogFiltersReady = Signal(int, dict)
     manualDiscoveryReady = Signal(dict)
+    interestDiscoveryReady = Signal(dict)
 
     def __init__(self, controller: AppController, services: DesktopServices) -> None:
         super().__init__()
@@ -1555,7 +1556,10 @@ class MainWindow(QMainWindow):
         self._catalog_filters_loading = False
         self._catalog_filter_threads: list[threading.Thread] = []
         self._manual_discovery_threads: list[threading.Thread] = []
+        self._interest_discovery_threads: list[threading.Thread] = []
         self._manual_discovery_running = False
+        self._interest_discovery_active = 0
+        self._catalog_has_manual_interest = False
         self._catalog_render_token = 0
         self._catalog_row_stretch_index: int | None = None
         self._catalog_layout_signature: tuple[Any, ...] | None = None
@@ -1569,6 +1573,7 @@ class MainWindow(QMainWindow):
         self.catalogCountReady.connect(self.handle_catalog_count_ready)
         self.catalogFiltersReady.connect(self.handle_catalog_filters_ready)
         self.manualDiscoveryReady.connect(self.handle_manual_discovery_ready)
+        self.interestDiscoveryReady.connect(self.handle_interest_discovery_ready)
         self.resize(1680, 980)
         status_bar = QStatusBar()
         status_bar.setSizeGripEnabled(False)
@@ -2673,6 +2678,53 @@ class MainWindow(QMainWindow):
         self.refresh_catalog()
         self.refresh_dashboard()
 
+    def start_interest_initial_discovery(self, seed_id: int) -> None:
+        self._interest_discovery_active += 1
+
+        def worker() -> None:
+            payload: dict[str, Any]
+            try:
+                payload = {
+                    "seed_id": seed_id,
+                    "summary": self.controller.run_interest_initial_discovery(
+                        seed_id,
+                        candidate_limit=150,
+                    ),
+                }
+            except Exception as exc:
+                payload = {"seed_id": seed_id, "error": humanize_exception(exc)}
+            self.interestDiscoveryReady.emit(payload)
+
+        self._interest_discovery_threads = [
+            thread for thread in self._interest_discovery_threads if thread.is_alive()
+        ]
+        thread = threading.Thread(target=worker, daemon=True, name=f"interest-discovery-{seed_id}")
+        self._interest_discovery_threads.append(thread)
+        thread.start()
+
+    def handle_interest_discovery_ready(self, payload: dict[str, Any]) -> None:
+        self._interest_discovery_threads = [
+            thread for thread in self._interest_discovery_threads if thread.is_alive()
+        ]
+        self._interest_discovery_active = max(0, self._interest_discovery_active - 1)
+        if self._closing:
+            return
+        error = payload.get("error")
+        if error:
+            self.statusBar().showMessage(str(error), 6000)
+            return
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        related = int(summary.get("related_candidates") or 0)
+        self.statusBar().showMessage(
+            f"Busqueda inicial lista: {related} candidatos en cola",
+            6000,
+        )
+        self.refresh_catalog_filters()
+        self.refresh_catalog()
+        self.refresh_dashboard()
+
     def toggle_dashboard_more_info(self, *_args: object) -> None:
         visible = not self.dashboard_more_info.isVisible()
         self.dashboard_more_info.setVisible(visible)
@@ -2802,11 +2854,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.controller.submit_interest(raw_value)
+            seed_payload = self.controller.submit_interest(raw_value)
             for f in (self.catalog_empty_input, self.topbar_quick_input, self.dashboard_quick_input):
                 if f is not None:
                     f.clear()
-            self.statusBar().showMessage("Interes guardado. La app seguira buscando videos.", 4000)
+            self._catalog_has_manual_interest = True
+            self.statusBar().showMessage("Interes guardado. Buscando 150 candidatos iniciales.", 4000)
             self.refresh_sources()
             self.refresh_runs()
             self.refresh_dashboard()
@@ -2814,6 +2867,7 @@ class MainWindow(QMainWindow):
             self.refresh_catalog()
             if hasattr(self, "catalog_empty_stack"):
                 self.catalog_empty_stack.setCurrentIndex(1)
+            self.start_interest_initial_discovery(int(seed_payload["seed_id"]))
         except Exception as exc:
             self.show_error("No se pudo guardar el interes", exc)
 
@@ -3277,6 +3331,12 @@ class MainWindow(QMainWindow):
     def update_catalog_surface(self) -> None:
         total_videos = int(self._latest_stats.get("total_videos", 0))
         active_run = self.controller.active_run_snapshot()
+        active_discovery = (
+            bool(active_run)
+            or self._manual_discovery_running
+            or self._interest_discovery_active > 0
+            or self._catalog_has_manual_interest
+        )
         has_videos = total_videos > 0
 
         self.catalog_controls_shell.setVisible(has_videos)
@@ -3287,7 +3347,7 @@ class MainWindow(QMainWindow):
             self.catalog_filters_toggle.setText("Mas filtros")
 
         if not has_videos:
-            self.catalog_empty_stack.setCurrentIndex(1 if active_run else 0)
+            self.catalog_empty_stack.setCurrentIndex(1 if active_discovery else 0)
             return
 
         self.render_catalog_cards()
@@ -3618,6 +3678,12 @@ class MainWindow(QMainWindow):
             if thread.is_alive():
                 thread.join(timeout=2.0)
         self._manual_discovery_threads = [thread for thread in self._manual_discovery_threads if thread.is_alive()]
+        for thread in list(self._interest_discovery_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._interest_discovery_threads = [
+            thread for thread in self._interest_discovery_threads if thread.is_alive()
+        ]
         super().closeEvent(event)
 
     def show_error(self, title: str, error: Exception) -> None:

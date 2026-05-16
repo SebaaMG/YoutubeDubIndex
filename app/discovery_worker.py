@@ -40,7 +40,7 @@ class DiscoveryWorker:
             "seed_top_channel_count": 0,
         }
 
-        claimed_seeds = self.repo.claim_discovery_seeds(limit=seed_limit, randomize=randomize_seeds)
+        claimed_seeds = self.repo.claim_discovery_seeds_mixed(limit=seed_limit, randomize=randomize_seeds)
         self._apply_seed_metrics(summary, claimed_seeds)
         for seed in claimed_seeds:
             summary["seeds"] += 1
@@ -163,7 +163,54 @@ class DiscoveryWorker:
             seed_rescan_delay_minutes=15,
         )
 
-    def _discover_seed(self, seed: dict[str, Any]) -> list[dict[str, Any]]:
+    def enqueue_immediate_seed_candidates(
+        self,
+        seed_id: int,
+        *,
+        candidate_limit: int = 150,
+    ) -> dict[str, int]:
+        seed = self.repo.get_discovery_seed(int(seed_id))
+        if not seed:
+            raise ValueError("Interes no encontrado.")
+        safe_limit = max(1, min(250, int(candidate_limit)))
+        summary = {
+            "seeds": 1,
+            "related_candidates": 0,
+            "inspected": 0,
+            "verified": 0,
+            "rejected": 0,
+            "failed": 0,
+            "candidate_unique_channels": 0,
+            "candidate_top_channel_count": 0,
+            "candidate_top_channel_percent": 0.0,
+            "seed_unique_channels": 1,
+            "seed_top_channel_count": 1,
+        }
+        try:
+            candidates = self._discover_seed(seed, candidate_limit=safe_limit)
+        except Exception:
+            self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=60)
+            summary["failed"] = 1
+            raise
+
+        for candidate in candidates:
+            self.repo.enqueue_candidate(
+                candidate,
+                source_seed_id=int(seed["id"]),
+                discovered_from_video_id=str(seed["value"]) if seed["source_type"] == "video" else None,
+                priority=max(1, int(seed["priority"] or 100) + 10),
+                score=1.0,
+            )
+        summary["related_candidates"] = len(candidates)
+        self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=15)
+        return summary
+
+    def _discover_seed(
+        self,
+        seed: dict[str, Any],
+        *,
+        candidate_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         source_type = str(seed["source_type"])
         if source_type == "video":
             return self.youtube.discover_related(str(seed["value"]))
@@ -172,7 +219,11 @@ class DiscoveryWorker:
                 {
                     "type": source_type,
                     "value": seed["value"],
-                    "max_candidates_per_run": int(getattr(self.settings, "discovery_seed_candidate_limit", 50)),
+                    "max_candidates_per_run": int(
+                        candidate_limit
+                        if candidate_limit is not None
+                        else getattr(self.settings, "discovery_seed_candidate_limit", 50)
+                    ),
                 }
             )
         return []

@@ -18,6 +18,10 @@ INTERNAL_DISCOVERY_SOURCE_VALUE = "__auto_discovery__"
 CATALOG_SEARCH_PROBE_LIMIT = 5_000
 CATALOG_SEARCH_DENSE_MATCH_RATIO = 0.005
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+CONTENT_DISCOVERY_SEED_KINDS = ("system_search", "system_channel", "user_search", "user_channel")
+FREE_DISCOVERY_SEED_KINDS = ("starter_video", "related_video")
+DISCOVERY_POOL_PATTERN = ("content",) * 7 + ("free",) * 3
+DISCOVERY_POOL_CURSOR_KEY = "discovery_pool_slot_index:v1"
 
 
 def normalize_audio_language(value: Any) -> str | None:
@@ -703,6 +707,58 @@ class Repository:
             )
             return int(cursor.fetchone()["id"])
 
+    def import_content_pool(self, pool_path: Path, *, version: str) -> dict[str, Any]:
+        if not pool_path.exists():
+            return {"skipped": True, "reason": "missing", "imported": 0}
+
+        preference_key = f"content_pool_version:{version}"
+        if self.get_preference(preference_key) == "1":
+            return {"skipped": True, "reason": "already_imported", "imported": 0}
+
+        with pool_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            entries = payload
+        elif isinstance(payload, dict):
+            entries = (
+                payload.get("theme_queries")
+                or payload.get("queries")
+                or payload.get("terms")
+                or []
+            )
+        else:
+            entries = []
+
+        imported = 0
+        for entry in entries:
+            priority = 50
+            label: str | None
+            value: str | None
+            if isinstance(entry, dict):
+                raw_value = entry.get("query") or entry.get("value") or entry.get("term")
+                value = str(raw_value or "").strip()
+                label = str(entry.get("label") or value).strip()
+                try:
+                    priority = int(entry.get("priority") or priority)
+                except (TypeError, ValueError):
+                    priority = 50
+            else:
+                value = str(entry or "").strip()
+                label = value
+            if not value:
+                continue
+            self.create_discovery_seed(
+                seed_kind="system_search",
+                source_type="search",
+                label=label or value,
+                value=value,
+                priority=priority,
+            )
+            imported += 1
+
+        self.set_preference(preference_key, "1")
+        return {"skipped": False, "imported": imported}
+
     def list_discovery_seeds(self) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             rows = conn.execute(
@@ -715,9 +771,100 @@ class Repository:
         return [dict(row) for row in rows]
 
     def claim_discovery_seeds(self, *, limit: int = 1, randomize: bool = False) -> list[dict[str, Any]]:
+        return self._claim_discovery_seeds_for_kinds(
+            CONTENT_DISCOVERY_SEED_KINDS + FREE_DISCOVERY_SEED_KINDS,
+            limit=limit,
+            randomize=randomize,
+        )
+
+    def claim_discovery_seeds_mixed(
+        self,
+        *,
+        limit: int = 1,
+        randomize: bool = False,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(50, int(limit)))
+        content_target, free_target = self._next_discovery_pool_targets(safe_limit)
+        selected: list[dict[str, Any]] = []
+
+        content_rows = self._claim_discovery_seeds_for_kinds(
+            CONTENT_DISCOVERY_SEED_KINDS,
+            limit=content_target,
+            randomize=randomize,
+        )
+        selected.extend(content_rows)
+
+        free_rows = self._claim_discovery_seeds_for_kinds(
+            FREE_DISCOVERY_SEED_KINDS,
+            limit=free_target,
+            randomize=randomize,
+            exclude_seed_ids=[int(row["id"]) for row in selected],
+        )
+        selected.extend(free_rows)
+
+        if len(content_rows) < content_target:
+            selected.extend(
+                self._claim_discovery_seeds_for_kinds(
+                    FREE_DISCOVERY_SEED_KINDS,
+                    limit=content_target - len(content_rows),
+                    randomize=randomize,
+                    exclude_seed_ids=[int(row["id"]) for row in selected],
+                )
+            )
+        if len(free_rows) < free_target:
+            selected.extend(
+                self._claim_discovery_seeds_for_kinds(
+                    CONTENT_DISCOVERY_SEED_KINDS,
+                    limit=free_target - len(free_rows),
+                    randomize=randomize,
+                    exclude_seed_ids=[int(row["id"]) for row in selected],
+                )
+            )
+        if len(selected) < safe_limit:
+            selected.extend(
+                self._claim_discovery_seeds_for_kinds(
+                    CONTENT_DISCOVERY_SEED_KINDS + FREE_DISCOVERY_SEED_KINDS,
+                    limit=safe_limit - len(selected),
+                    randomize=randomize,
+                    exclude_seed_ids=[int(row["id"]) for row in selected],
+                )
+            )
+        return selected[:safe_limit]
+
+    def _next_discovery_pool_targets(self, limit: int) -> tuple[int, int]:
+        safe_limit = max(1, min(50, int(limit)))
+        try:
+            cursor = int(self.get_preference(DISCOVERY_POOL_CURSOR_KEY) or "0")
+        except ValueError:
+            cursor = 0
+        pattern_size = len(DISCOVERY_POOL_PATTERN)
+        slots = [
+            DISCOVERY_POOL_PATTERN[(cursor + index) % pattern_size]
+            for index in range(safe_limit)
+        ]
+        self.set_preference(DISCOVERY_POOL_CURSOR_KEY, str((cursor + safe_limit) % pattern_size))
+        return slots.count("content"), slots.count("free")
+
+    def _claim_discovery_seeds_for_kinds(
+        self,
+        seed_kinds: tuple[str, ...],
+        *,
+        limit: int = 1,
+        randomize: bool = False,
+        exclude_seed_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not seed_kinds or int(limit) <= 0:
+            return []
         timestamp = to_iso()
         safe_limit = max(1, min(50, int(limit)))
         tie_breaker = "RANDOM()" if randomize else "COALESCE(e.next_discovery_at, e.created_at) ASC, e.id ASC"
+        kind_placeholders = ",".join("?" for _ in seed_kinds)
+        exclude_ids = [int(seed_id) for seed_id in (exclude_seed_ids or [])]
+        exclude_clause = ""
+        if exclude_ids:
+            exclude_placeholders = ",".join("?" for _ in exclude_ids)
+            exclude_clause = f"AND ds.id NOT IN ({exclude_placeholders})"
+        params: list[Any] = [timestamp, *seed_kinds, *exclude_ids, safe_limit]
         with self.db.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -741,6 +888,8 @@ class Repository:
                     LEFT JOIN videos v ON ds.source_type = 'video' AND v.video_id = ds.value
                     WHERE ds.enabled = 1
                       AND (ds.next_discovery_at IS NULL OR ds.next_discovery_at <= ?)
+                      AND ds.seed_kind IN ({kind_placeholders})
+                      {exclude_clause}
                 ),
                 channel_counts AS (
                     SELECT seed_channel_key, COUNT(*) AS seed_channel_count
@@ -758,9 +907,17 @@ class Repository:
                     {tie_breaker}
                 LIMIT ?
                 """,
-                (timestamp, safe_limit),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_discovery_seed(self, seed_id: int) -> dict[str, Any] | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM discovery_seeds WHERE id = ?",
+                (int(seed_id),),
+            ).fetchone()
+        return dict(row) if row else None
 
     def count_video_discovery_seeds_for_channel(self, channel_id: str | None, channel: str | None) -> int:
         cleaned_channel_id = str(channel_id or "").strip()
