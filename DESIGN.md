@@ -1,7 +1,7 @@
 ---
 version: alpha
-name: DubIndex Desktop Dark
-description: Screenshot-derived visual system for the YouTube Dub Indexer desktop app.
+name: Desktop Dark Catalog
+description: Screenshot-derived visual system for the desktop YouTube dub discovery app.
 colors:
   primary: "#070B10"
   surface: "#0D1218"
@@ -72,7 +72,7 @@ components:
 
 ## Overview
 
-DubIndex uses a dense, native desktop layout on a near-black canvas. The UI should feel like a focused media-indexing tool: compact navigation, sharp card edges, strong cyan accents, and restrained blue primary actions.
+The app uses a dense, native desktop layout on a near-black canvas. The UI should feel like a focused media-indexing tool: compact navigation, sharp card edges, strong cyan accents, and restrained blue primary actions.
 
 ## Colors
 
