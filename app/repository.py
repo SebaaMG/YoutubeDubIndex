@@ -729,6 +729,10 @@ class Repository:
         else:
             entries = []
 
+        replace_existing_system_search = bool(
+            isinstance(payload, dict) and payload.get("replace_existing_system_search")
+        )
+        packaged_values: list[str] = []
         imported = 0
         for entry in entries:
             priority = 50
@@ -747,6 +751,7 @@ class Repository:
                 label = value
             if not value:
                 continue
+            packaged_values.append(value)
             self.create_discovery_seed(
                 seed_kind="system_search",
                 source_type="search",
@@ -756,8 +761,25 @@ class Repository:
             )
             imported += 1
 
+        disabled_existing = 0
+        if replace_existing_system_search and packaged_values:
+            placeholders = ",".join("?" for _ in packaged_values)
+            timestamp = to_iso()
+            with self.db.connect() as conn:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE discovery_seeds
+                    SET enabled = 0, updated_at = ?
+                    WHERE seed_kind = 'system_search'
+                      AND source_type = 'search'
+                      AND value NOT IN ({placeholders})
+                    """,
+                    (timestamp, *packaged_values),
+                )
+                disabled_existing = int(cursor.rowcount)
+
         self.set_preference(preference_key, "1")
-        return {"skipped": False, "imported": imported}
+        return {"skipped": False, "imported": imported, "disabled_existing": disabled_existing}
 
     def list_discovery_seeds(self) -> list[dict[str, Any]]:
         with self.db.connect() as conn:

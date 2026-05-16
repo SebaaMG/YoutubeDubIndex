@@ -29,7 +29,7 @@ class Settings:
     discovery_seed_candidate_limit: int = 50
     discovery_loop_interval_seconds: int = 45
     starter_pack_version: str = "v3"
-    content_pool_version: str = "v1"
+    content_pool_version: str = "v2"
 
     @property
     def runtime_root(self) -> Path:
@@ -73,7 +73,7 @@ class Settings:
 
     @property
     def content_pool_path(self) -> Path:
-        return self.resource_root / "resources" / "discovery" / "content_pool_v1.json"
+        return self.resource_root / "resources" / "discovery" / "content_pool_v2.json"
 
 
 def get_settings() -> Settings:

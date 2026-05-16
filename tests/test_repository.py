@@ -1266,6 +1266,44 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual({seed["seed_kind"] for seed in seeds}, {"system_search"})
         self.assertEqual({seed["source_type"] for seed in seeds}, {"search"})
 
+    def test_import_content_pool_can_replace_packaged_system_search_seeds(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="system_search",
+            source_type="search",
+            label="Old packaged query",
+            value="streamer controversy explained",
+            priority=50,
+        )
+        self.repo.create_discovery_seed(
+            seed_kind="user_search",
+            source_type="search",
+            label="Manual query",
+            value="mrbeast",
+            priority=50,
+        )
+        pool_path = Path(self.temp_dir.name) / "content_pool_v2.json"
+        pool_path.write_text(
+            json.dumps(
+                {
+                    "version": "test-v2",
+                    "replace_existing_system_search": True,
+                    "theme_queries": [
+                        {"query": "the problem with YouTube", "priority": 50},
+                        {"query": "influencer got exposed", "priority": 50},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.repo.import_content_pool(pool_path, version="test-v2")
+
+        seeds = {seed["value"]: seed for seed in self.repo.list_discovery_seeds()}
+        self.assertEqual(seeds["streamer controversy explained"]["enabled"], 0)
+        self.assertEqual(seeds["mrbeast"]["enabled"], 1)
+        self.assertEqual(seeds["the problem with YouTube"]["enabled"], 1)
+        self.assertEqual(seeds["influencer got exposed"]["enabled"], 1)
+
     def test_mixed_discovery_seed_claim_uses_seven_content_and_three_free_slots(self) -> None:
         for index in range(8):
             self.repo.create_discovery_seed(

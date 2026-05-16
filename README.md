@@ -44,7 +44,7 @@ La app empaquetada migra automaticamente una base antigua si encuentra `data\` j
 
 El crawler local no intenta indexar todo YouTube. Usa una mezcla simple de seeds para encontrar candidatos con mas probabilidad de servir como material reaccionable:
 
-- 70% pool de contenido: busquedas amplias incluidas en `resources/discovery/content_pool_v1.json` mas busquedas/canales escritos por el usuario.
+- 70% pool de contenido: busquedas amplias por familias incluidas en `resources/discovery/content_pool_v2.json` mas busquedas/canales escritos por el usuario.
 - 30% YouTube libre: starter videos y videos relacionados de dubs ya verificados.
 
 El patron se aplica al elegir seeds de descubrimiento, no al orden final del catalogo. No hay ranking dinamico global ni recalculo sobre millones de filas; los candidatos se encolan y luego solo entran al feed si pasan la inspeccion de dub espanol confirmado.

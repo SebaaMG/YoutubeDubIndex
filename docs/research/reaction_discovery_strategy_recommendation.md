@@ -8,7 +8,7 @@ Target app: local Windows desktop app for discovering YouTube videos with confir
 
 Implemented in `main` after the last two pushes:
 
-- `resources/discovery/content_pool_v1.json` ships broad English content-search seeds for reaction-friendly discovery.
+- `resources/discovery/content_pool_v2.json` ships broad English content-search seeds grouped by balanced reaction lanes for reaction-friendly discovery.
 - Startup imports that file idempotently as `system_search` seeds using `content_pool_version`.
 - The discovery worker now claims seeds with a deterministic 10-slot pattern: 7 content slots and 3 free YouTube graph slots.
 - Content slots include `system_search`, `system_channel`, `user_search`, and `user_channel`.
@@ -53,23 +53,21 @@ The app should demote low-signal clusters, not reject broad topics.
 
 ## Implemented Data
 
-The shipped resource is `resources/discovery/content_pool_v1.json`. It intentionally contains broad search terms rather than a hard taxonomy:
+The shipped resource is `resources/discovery/content_pool_v2.json`. It intentionally contains a flat `theme_queries` list with balanced `family` metadata for audit only; every query still imports as a normal `system_search` seed:
 
 ```json
 {
-  "version": "v1",
+  "version": "v2",
+  "replace_existing_system_search": true,
   "theme_queries": [
-    "internet mysteries explained",
-    "streamer controversy explained",
-    "influencer scam exposed",
-    "TikTok trend explained",
-    "lost media explained",
-    "internet iceberg explained"
+    {"family": "platform_creator_internet", "query": "the problem with YouTube"},
+    {"family": "scams_exposed_downfall", "query": "influencer got exposed"},
+    {"family": "weird_mystery_creepy", "query": "internet rabbit holes"}
   ]
 }
 ```
 
-Theme terms are not shown directly. They only create search seeds. Candidates still need inspection and must have confirmed Spanish dub before appearing in the catalog.
+Theme terms are not shown directly. They only create search seeds. Candidates still need inspection and must have confirmed Spanish dub before appearing in the catalog. The v2 import disables older packaged `system_search` seeds so already-used databases do not keep the suffix-heavy v1 pool, while preserving `user_search` and `user_channel` interests.
 
 ## Future Scoring Option
 
@@ -97,7 +95,7 @@ The score should not reject anything. It should only change inspection order.
 
 ## Implementation Order
 
-1. Import static profile seeds into existing `discovery_seeds`. Done for `content_pool_v1.json`.
+1. Import static profile seeds into existing `discovery_seeds`. Done for `content_pool_v2.json`.
    - theme queries become `system_search` seeds.
    - Gate import by an `app_preferences` version key so it is idempotent.
 
