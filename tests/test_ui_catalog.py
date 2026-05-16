@@ -290,14 +290,14 @@ class CatalogUiTests(unittest.TestCase):
         self.assertEqual(self.window.catalog_model.rowCount(), 1)
         self.assertEqual(self.window.catalog_results_count.text(), "1 encontrados")
 
-    def test_manual_feed_button_runs_fifty_candidate_expansion(self) -> None:
+    def test_manual_feed_button_runs_two_hundred_candidate_expansion(self) -> None:
         worker = FakeDiscoveryWorker()
         self.services.discovery_worker = worker  # type: ignore[assignment]
         self.window.switch_page("catalog")
         self.window.show()
         self.app.processEvents()
 
-        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 50")
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 200")
         self.window.catalog_manual_discovery_button.click()
         for _ in range(100):
             self.app.processEvents()
@@ -305,8 +305,8 @@ class CatalogUiTests(unittest.TestCase):
                 break
             time.sleep(0.01)
 
-        self.assertEqual(worker.calls, [{"candidate_limit": 50, "max_seed_discoveries": 10}])
-        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 50")
+        self.assertEqual(worker.calls, [{"candidate_limit": 200, "max_seed_discoveries": 10}])
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 200")
         self.assertTrue(self.window.catalog_manual_discovery_button.isEnabled())
 
     def test_catalog_year_controls_offer_scrollable_youtube_year_range(self) -> None:

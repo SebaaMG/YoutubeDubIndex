@@ -179,7 +179,7 @@ class AppController:
             max_candidate_inspections=max_candidate_inspections,
         )
 
-    def run_manual_feed_expansion(self, *, candidate_limit: int = 50) -> dict[str, int]:
+    def run_manual_feed_expansion(self, *, candidate_limit: int = 200) -> dict[str, int]:
         if self.services.discovery_worker is None:
             return {}
         return self.services.discovery_worker.run_manual_feed_batch(

@@ -47,6 +47,7 @@ YOUTUBE_FIRST_YEAR = 2005
 CATALOG_CARD_BATCH_SIZE = 32
 CATALOG_PAGE_SIZE = 160
 STARTUP_BACKFILL_DELAY_MS = 2500
+MANUAL_DISCOVERY_CANDIDATE_LIMIT = 200
 
 
 APP_STYLE = """
@@ -2254,7 +2255,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.catalog_query, 3)
         controls_layout.addWidget(self.catalog_lang, 1)
         controls_layout.addWidget(self.catalog_sort)
-        self.catalog_manual_discovery_button = QPushButton("Explorar 50")
+        self.catalog_manual_discovery_button = QPushButton(f"Explorar {MANUAL_DISCOVERY_CANDIDATE_LIMIT}")
         self.catalog_manual_discovery_button.setProperty("role", "ghost")
         self.catalog_manual_discovery_button.setProperty("compactCatalog", "true")
         self.catalog_manual_discovery_button.setMinimumHeight(36)
@@ -2635,12 +2636,19 @@ class MainWindow(QMainWindow):
         self._manual_discovery_running = True
         self.catalog_manual_discovery_button.setEnabled(False)
         self.catalog_manual_discovery_button.setText("Explorando...")
-        self.statusBar().showMessage("Explorando 50 videos recomendados", 4000)
+        self.statusBar().showMessage(
+            f"Explorando {MANUAL_DISCOVERY_CANDIDATE_LIMIT} videos recomendados",
+            4000,
+        )
 
         def worker() -> None:
             payload: dict[str, Any]
             try:
-                payload = {"summary": self.controller.run_manual_feed_expansion(candidate_limit=50)}
+                payload = {
+                    "summary": self.controller.run_manual_feed_expansion(
+                        candidate_limit=MANUAL_DISCOVERY_CANDIDATE_LIMIT,
+                    )
+                }
             except Exception as exc:
                 payload = {"error": humanize_exception(exc)}
             self.manualDiscoveryReady.emit(payload)
@@ -2658,7 +2666,7 @@ class MainWindow(QMainWindow):
         ]
         self._manual_discovery_running = False
         self.catalog_manual_discovery_button.setEnabled(True)
-        self.catalog_manual_discovery_button.setText("Explorar 50")
+        self.catalog_manual_discovery_button.setText(f"Explorar {MANUAL_DISCOVERY_CANDIDATE_LIMIT}")
         error = payload.get("error")
         if error:
             self.statusBar().showMessage(str(error), 6000)
