@@ -28,7 +28,7 @@ dist\YouTubeDubIndexer\YouTubeDubIndexer.exe
 - UI nativa `PySide6 Widgets`
 - Persistencia local SQLite
   - modo Python: `data\dub_index_desktop.db` dentro del proyecto
-  - `.exe` empaquetado: `%LOCALAPPDATA%\YouTubeDubIndexer\data\dub_index_desktop.db`
+  - `.exe` empaquetado: `dist\YouTubeDubIndexer\data\dub_index_desktop.db`, junto al ejecutable
 - Catalogo principal `Descubrir`, con filtros de idioma, fecha, favoritos y tipo de dub
 - Busqueda rapida por tema o canal: guarda el interes como seed permanente y encola 150 candidatos iniciales en background
 - Boton `Explorar 200`: inspecciona hasta 200 candidatos por click usando el mismo algoritmo de descubrimiento
@@ -38,7 +38,9 @@ dist\YouTubeDubIndexer\YouTubeDubIndexer.exe
 - Starter pack local y pool de descubrimiento incluido en el bundle
 - Bundle `one-folder` con `node.exe` incluido
 
-La app empaquetada migra automaticamente una base antigua si encuentra `data\` junto al `.exe` y aun no existe una DB en `%LOCALAPPDATA%`.
+La app empaquetada usa modo portable: para compartirla con el mismo catalogo, comparte la carpeta completa `dist\YouTubeDubIndexer\`, incluyendo `data\dub_index_desktop.db` y `_internal\`. Si existe una base antigua en `%LOCALAPPDATA%\YouTubeDubIndexer\data\`, la primera apertura de la nueva build la copia automaticamente a la carpeta portable cuando todavia no hay DB junto al `.exe`.
+
+El script `build_exe.ps1` exporta una copia consistente de la DB actual al terminar el build. Si encuentra varias DB posibles, usa la mas reciente entre una DB portable previa, `%LOCALAPPDATA%` y `data\` del proyecto. El pool de descubrimiento va dentro del bundle en `_internal\resources\discovery\`.
 
 ## Descubrimiento automatico
 

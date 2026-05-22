@@ -61,6 +61,27 @@ class StorageTests(unittest.TestCase):
 
             self.assertEqual(settings.db_path.read_text(encoding="utf-8"), "current-db")
 
+    def test_prepare_runtime_storage_migrates_old_appdata_database_to_portable_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            portable_data_dir = root / "dist" / "YouTubeDubIndexer" / "data"
+            old_appdata_data_dir = root / "localappdata" / "YouTubeDubIndexer" / "data"
+            old_appdata_data_dir.mkdir(parents=True)
+            old_db = old_appdata_data_dir / "dub_index_desktop.db"
+            old_db.write_text("old-appdata-db", encoding="utf-8")
+
+            settings = SimpleNamespace(
+                data_dir=portable_data_dir,
+                db_path=portable_data_dir / "dub_index_desktop.db",
+                legacy_bundle_data_dir=portable_data_dir,
+                legacy_appdata_data_dir=old_appdata_data_dir,
+            )
+
+            prepare_runtime_storage(settings)
+
+            self.assertTrue(settings.db_path.exists())
+            self.assertEqual(settings.db_path.read_text(encoding="utf-8"), "old-appdata-db")
+
 
 if __name__ == "__main__":
     unittest.main()

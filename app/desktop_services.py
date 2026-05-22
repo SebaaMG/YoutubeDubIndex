@@ -28,15 +28,23 @@ class DesktopServices:
 def prepare_runtime_storage(settings: Settings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
-    legacy_data_dir = settings.legacy_bundle_data_dir
-    if not legacy_data_dir.exists():
-        return
-    if legacy_data_dir.resolve() == settings.data_dir.resolve():
-        return
     if settings.db_path.exists():
         return
 
-    shutil.copytree(legacy_data_dir, settings.data_dir, dirs_exist_ok=True)
+    migration_sources = [
+        getattr(settings, "legacy_bundle_data_dir", None),
+        getattr(settings, "legacy_appdata_data_dir", None),
+    ]
+    for legacy_data_dir in migration_sources:
+        if legacy_data_dir is None or not legacy_data_dir.exists():
+            continue
+        if legacy_data_dir.resolve() == settings.data_dir.resolve():
+            continue
+        legacy_db = legacy_data_dir / settings.db_path.name
+        if not legacy_db.exists():
+            continue
+        shutil.copytree(legacy_data_dir, settings.data_dir, dirs_exist_ok=True)
+        return
 
 
 def build_services() -> DesktopServices:
@@ -186,6 +194,22 @@ class AppController:
             candidate_limit=candidate_limit,
             max_seed_discoveries=10,
         )
+
+    def check_for_update(self) -> dict[str, Any]:
+        from .updater import UpdateManager
+
+        return UpdateManager(self.services.settings).check_for_update()
+
+    def download_update_and_restart(self, manifest: Any) -> dict[str, Any]:
+        from .updater import UpdateManager
+
+        manager = UpdateManager(self.services.settings)
+        downloaded = manager.download_update(manifest)
+        manager.launch_update_and_restart(downloaded)
+        return {
+            "scheduled": True,
+            "version": manifest.version,
+        }
 
     def update_source(
         self,

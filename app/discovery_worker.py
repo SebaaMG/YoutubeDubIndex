@@ -50,9 +50,9 @@ class DiscoveryWorker:
                 self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=60)
                 summary["failed"] += 1
                 continue
-            for candidate in candidates:
-                self.repo.enqueue_candidate(
-                    candidate,
+            if candidates:
+                self.repo.enqueue_candidates_batch(
+                    candidates,
                     source_seed_id=int(seed["id"]),
                     discovered_from_video_id=str(seed["value"]) if seed["source_type"] == "video" else None,
                     priority=max(1, int(seed["priority"] or 100) + 10),
@@ -63,6 +63,12 @@ class DiscoveryWorker:
 
         claimed_candidates = self.repo.claim_frontier_candidates(limit=inspect_limit)
         self._apply_candidate_metrics(summary, claimed_candidates)
+        result_payloads: list[dict[str, Any]] = []
+        verified_video_ids: list[str] = []
+        rejected_video_ids: list[str] = []
+        failed_candidates: list[tuple[str, str, int]] = []
+        related_seed_payloads: list[dict[str, Any]] = []
+        seed_count_cache: dict[str, int] = {}
         for candidate in claimed_candidates:
             video_id = str(candidate["video_id"])
             summary["inspected"] += 1
@@ -70,48 +76,74 @@ class DiscoveryWorker:
                 result = self.youtube.inspect_video(video_id)
             except Exception as exc:
                 attempts = int(candidate.get("attempts") or 0)
-                self.repo.mark_candidate_failed(video_id, str(exc), delay_minutes=min(24 * 60, 30 * (attempts + 1)))
+                failed_candidates.append((video_id, str(exc), min(24 * 60, 30 * (attempts + 1))))
                 summary["failed"] += 1
                 continue
 
             if not result.has_dubbing:
-                self.repo.mark_candidate_rejected(video_id, "no dubbing")
+                rejected_video_ids.append(video_id)
                 summary["rejected"] += 1
                 continue
 
-            self.repo.store_inspection_result(
-                video_id,
-                audio_languages=result.audio_languages,
-                has_dubbing=True,
-                published_at=result.published_at or candidate.get("published_at"),
-                view_count=result.view_count if result.view_count is not None else candidate.get("view_count"),
-                dub_kind=result.dub_kind,
-                title=result.title or candidate.get("title"),
-                channel=result.channel or candidate.get("channel"),
-                channel_id=result.channel_id or candidate.get("channel_id"),
-                duration_seconds=(
+            result_payloads.append(
+                {
+                    "video_id": video_id,
+                    "audio_languages": result.audio_languages,
+                    "has_dubbing": True,
+                    "published_at": result.published_at or candidate.get("published_at"),
+                    "view_count": result.view_count if result.view_count is not None else candidate.get("view_count"),
+                    "dub_kind": result.dub_kind,
+                    "title": result.title or candidate.get("title"),
+                    "channel": result.channel or candidate.get("channel"),
+                    "channel_id": result.channel_id or candidate.get("channel_id"),
+                    "duration_seconds": (
                     result.duration_seconds
                     if result.duration_seconds is not None
                     else candidate.get("duration_seconds")
-                ),
-                thumbnail_url=result.thumbnail_url or candidate.get("thumbnail_url"),
-                dub_confidence=getattr(result, "dub_confidence", None),
-                dub_evidence=getattr(result, "dub_evidence", None),
-                classifier_version=getattr(self.settings, "dub_classifier_version", 6),
+                    ),
+                    "thumbnail_url": result.thumbnail_url or candidate.get("thumbnail_url"),
+                    "dub_confidence": getattr(result, "dub_confidence", None),
+                    "dub_evidence": getattr(result, "dub_evidence", None),
+                    "classifier_version": getattr(self.settings, "dub_classifier_version", 6),
+                }
             )
-            self.repo.mark_candidate_verified(video_id)
+            verified_video_ids.append(video_id)
             channel_id = result.channel_id or candidate.get("channel_id")
             channel = result.channel or candidate.get("channel")
-            same_channel_seed_count = self.repo.count_video_discovery_seeds_for_channel(channel_id, channel)
+            channel_key = self._row_channel_key(
+                {
+                    "video_id": video_id,
+                    "channel_id": channel_id,
+                    "channel": channel,
+                }
+            )
+            if channel_key in seed_count_cache:
+                same_channel_seed_count = seed_count_cache[channel_key]
+            else:
+                same_channel_seed_count = self.repo.count_video_discovery_seeds_for_channel(channel_id, channel)
             seed_priority = 80 + min(50, same_channel_seed_count * 2)
-            self.repo.create_discovery_seed(
-                seed_kind="related_video",
-                source_type="video",
-                label=result.title or str(candidate.get("title") or video_id),
-                value=video_id,
-                priority=min(130, seed_priority),
+            seed_count_cache[channel_key] = same_channel_seed_count + 1
+            related_seed_payloads.append(
+                {
+                    "seed_kind": "related_video",
+                    "source_type": "video",
+                    "label": result.title or str(candidate.get("title") or video_id),
+                    "value": video_id,
+                    "priority": min(130, seed_priority),
+                }
             )
             summary["verified"] += 1
+
+        if result_payloads:
+            self.repo.store_inspection_results_batch(result_payloads)
+        if verified_video_ids:
+            self.repo.mark_candidates_verified(verified_video_ids)
+        if related_seed_payloads:
+            self.repo.create_discovery_seeds_batch(related_seed_payloads)
+        if rejected_video_ids:
+            self.repo.mark_candidates_rejected(rejected_video_ids, "no dubbing")
+        if failed_candidates:
+            self.repo.mark_candidates_failed(failed_candidates)
 
         return summary
 
@@ -193,9 +225,9 @@ class DiscoveryWorker:
             summary["failed"] = 1
             raise
 
-        for candidate in candidates:
-            self.repo.enqueue_candidate(
-                candidate,
+        if candidates:
+            self.repo.enqueue_candidates_batch(
+                candidates,
                 source_seed_id=int(seed["id"]),
                 discovered_from_video_id=str(seed["value"]) if seed["source_type"] == "video" else None,
                 priority=max(1, int(seed["priority"] or 100) + 10),

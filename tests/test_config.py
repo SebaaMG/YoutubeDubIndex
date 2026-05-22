@@ -20,7 +20,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.legacy_bundle_data_dir, root / "data")
             self.assertEqual(settings.bundled_node_path, root / "vendor" / "node" / "node.exe")
 
-    def test_runtime_and_data_paths_in_frozen_mode_use_localappdata(self) -> None:
+    def test_runtime_and_data_paths_in_frozen_mode_are_portable(self) -> None:
         with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as local_appdata_dir:
             project_root = Path(project_dir)
             exe_root = project_root / "dist" / "YouTubeDubIndexer"
@@ -33,10 +33,11 @@ class ConfigTests(unittest.TestCase):
                 patch.dict("os.environ", {"LOCALAPPDATA": local_appdata_dir}, clear=False),
             ):
                 settings = Settings(project_root=project_root)
-                self.assertEqual(settings.runtime_root, Path(local_appdata_dir) / "YouTubeDubIndexer")
-                self.assertEqual(settings.data_dir, Path(local_appdata_dir) / "YouTubeDubIndexer" / "data")
+                self.assertEqual(settings.runtime_root, exe_root)
+                self.assertEqual(settings.data_dir, exe_root / "data")
                 self.assertEqual(settings.executable_root, exe_root)
                 self.assertEqual(settings.legacy_bundle_data_dir, exe_root / "data")
+                self.assertEqual(settings.legacy_appdata_data_dir, Path(local_appdata_dir) / "YouTubeDubIndexer" / "data")
                 self.assertEqual(settings.resource_root, resource_root)
 
 

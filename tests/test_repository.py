@@ -98,6 +98,58 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(len(dubbed_only), 1)
         self.assertEqual(len(all_items), 2)
 
+    def test_dashboard_dubbed_videos_matches_default_discover_count(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 10))
+
+        def add_result(
+            video_id: str,
+            audio_languages: list[str],
+            *,
+            published_at: str | None,
+            view_count: int | None,
+        ) -> None:
+            self.repo.upsert_candidate(
+                CandidateVideo(
+                    video_id,
+                    f"Title {video_id}",
+                    "Stats Channel",
+                    "stats-channel",
+                    100,
+                    None,
+                    source_id,
+                    to_iso(),
+                )
+            )
+            self.repo.store_inspection_result(
+                video_id,
+                audio_languages=audio_languages,
+                has_dubbing=True,
+                dub_evidence={
+                    "source": "inspection",
+                    "original_audio_languages": ["en"],
+                    "auto_dubbed_languages": [],
+                },
+                published_at=published_at,
+                view_count=view_count,
+            )
+
+        add_result("spanish-ready", ["en", "es-US"], published_at="2026-04-20", view_count=100)
+        add_result("french-only", ["en", "fr"], published_at="2026-04-21", view_count=100)
+        add_result("spanish-missing-date", ["en", "es-US"], published_at=None, view_count=100)
+        add_result("spanish-missing-views", ["en", "es-US"], published_at="2026-04-22", view_count=None)
+
+        default_discover_count = self.repo.count_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+        )
+        stats = self.repo.dashboard_stats()
+
+        self.assertEqual(default_discover_count, 1)
+        self.assertEqual(stats["dubbed_videos"], default_discover_count)
+
     def test_catalog_can_sort_by_views_and_filter_by_year(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
 

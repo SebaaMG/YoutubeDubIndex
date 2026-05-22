@@ -12,6 +12,16 @@ from app.repository import CandidateVideo, Repository, SourceInput, to_iso
 from app.youtube import InspectionResult
 
 
+class CountingDatabase(Database):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.connect_count = 0
+
+    def connect(self):  # type: ignore[override]
+        self.connect_count += 1
+        return super().connect()
+
+
 class FakeYouTubeService:
     def __init__(self) -> None:
         self.related_calls: list[str] = []
@@ -279,6 +289,26 @@ class DiscoveryWorkerTests(unittest.TestCase):
             page_size=100,
         )
         self.assertEqual(len(catalog["items"]), 50)
+
+    def test_manual_feed_batch_batches_database_writes(self) -> None:
+        db = CountingDatabase(self.settings.db_path)
+        db.initialize()
+        repo = Repository(db)
+        youtube = FeedBatchYouTubeService()
+        worker = DiscoveryWorker(repo, youtube, self.settings)
+        repo.create_discovery_seed(
+            seed_kind="starter_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=80,
+        )
+        db.connect_count = 0
+
+        summary = worker.run_manual_feed_batch(candidate_limit=50, max_seed_discoveries=1)
+
+        self.assertEqual(summary["verified"], 50)
+        self.assertLessEqual(db.connect_count, 15)
 
     def test_run_once_uses_mixed_content_and_free_seed_pools_without_scoring_candidates(self) -> None:
         youtube = MixedSeedYouTubeService()

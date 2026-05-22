@@ -12,6 +12,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8876
     db_filename: str = "dub_index_desktop.db"
+    app_version: str = "2026.05.17.1"
     app_title: str = ""
     startup_test_video_id: str = "dQw4w9WgXcQ"
     inspect_workers: int = 4
@@ -30,6 +31,7 @@ class Settings:
     discovery_loop_interval_seconds: int = 45
     starter_pack_version: str = "v3"
     content_pool_version: str = "v2"
+    update_manifest_url: str = ""
 
     @property
     def runtime_root(self) -> Path:
@@ -66,6 +68,10 @@ class Settings:
     @property
     def legacy_bundle_data_dir(self) -> Path:
         return self.executable_root / "data"
+
+    @property
+    def legacy_appdata_data_dir(self) -> Path:
+        return runtime.local_appdata_root(self.app_storage_dirname) / "data"
 
     @property
     def starter_pack_path(self) -> Path:

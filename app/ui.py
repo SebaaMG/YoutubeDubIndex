@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import os
 import threading
 from typing import Any, Callable
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QPoint, QRect, QSize, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QMouseEvent, QPainter, QPixmap, QResizeEvent
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QPoint, QRect, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QImage, QMouseEvent, QPainter, QPixmap, QResizeEvent
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -48,6 +49,9 @@ CATALOG_CARD_BATCH_SIZE = 32
 CATALOG_PAGE_SIZE = 160
 STARTUP_BACKFILL_DELAY_MS = 2500
 MANUAL_DISCOVERY_CANDIDATE_LIMIT = 200
+THUMBNAIL_RENDER_SCALE = 0.75
+CATALOG_BACKGROUND_COUNT_MAX_VIDEOS = 100_000
+CATALOG_THUMBNAIL_PREFETCH_ROWS = 30
 
 
 APP_STYLE = """
@@ -985,6 +989,14 @@ class CatalogListModel(QAbstractListModel):
         super().__init__(parent)
         self.items: list[dict[str, Any]] = []
         self._pixmaps: dict[str, QPixmap] = {}
+        self._url_rows: dict[str, set[int]] = {}
+
+    def _index_thumbnail_rows(self) -> None:
+        self._url_rows = {}
+        for row, item in enumerate(self.items):
+            url = str(item.get("thumbnail_url") or "")
+            if url:
+                self._url_rows.setdefault(url, set()).add(row)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
         if parent.isValid():
@@ -1005,6 +1017,7 @@ class CatalogListModel(QAbstractListModel):
     def set_items(self, items: list[dict[str, Any]]) -> None:
         self.beginResetModel()
         self.items = list(items)
+        self._index_thumbnail_rows()
         self.endResetModel()
 
     def append_items(self, items: list[dict[str, Any]]) -> None:
@@ -1013,15 +1026,15 @@ class CatalogListModel(QAbstractListModel):
         start = len(self.items)
         self.beginInsertRows(QModelIndex(), start, start + len(items) - 1)
         self.items.extend(items)
+        for offset, item in enumerate(items):
+            url = str(item.get("thumbnail_url") or "")
+            if url:
+                self._url_rows.setdefault(url, set()).add(start + offset)
         self.endInsertRows()
 
     def set_thumbnail(self, url: str, pixmap: QPixmap) -> None:
         self._pixmaps[url] = pixmap
-        changed_rows = [
-            row
-            for row, item in enumerate(self.items)
-            if str(item.get("thumbnail_url") or "") == url
-        ]
+        changed_rows = self._url_rows.get(url, set())
         for row in changed_rows:
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, [CATALOG_PIXMAP_ROLE])
@@ -1146,19 +1159,18 @@ class CatalogCardDelegate(QStyledItemDelegate):
 
         pixmap = index.data(CATALOG_PIXMAP_ROLE)
         if isinstance(pixmap, QPixmap) and not pixmap.isNull():
-            scaled = pixmap.scaled(
-                thumb_rect.size(),
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x = thumb_rect.left() + (thumb_rect.width() - scaled.width()) // 2
-            y = thumb_rect.top() + (thumb_rect.height() - scaled.height()) // 2
             painter.setClipRect(thumb_rect)
-            painter.drawPixmap(x, y, scaled)
+            source = QRect(
+                max(0, (pixmap.width() - thumb_rect.width()) // 2),
+                max(0, (pixmap.height() - thumb_rect.height()) // 2),
+                min(thumb_rect.width(), pixmap.width()),
+                min(thumb_rect.height(), pixmap.height()),
+            )
+            painter.drawPixmap(thumb_rect, pixmap, source)
             painter.setClipping(False)
         else:
             painter.setPen(QColor("#758091"))
-            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "Cargando thumbnail")
+            painter.drawText(thumb_rect, Qt.AlignmentFlag.AlignCenter, "")
 
         duration = format_duration(item.get("duration_seconds"))
         if duration:
@@ -1336,21 +1348,27 @@ class CatalogListView(QListView):
         self.visibleRowsChanged.emit()
 
 
-class ThumbnailService:
+class ThumbnailService(QObject):
+    decodedReady = Signal(object, object)
+
     def __init__(self, owner: QWidget, cache_dir: Any, *, max_memory_bytes: int = 128 * 1024 * 1024) -> None:
+        super().__init__(owner)
         self.owner = owner
         self.max_memory_bytes = max_memory_bytes
         self._memory_bytes = 0
         self._cache: OrderedDict[tuple[str, int, int], QPixmap] = OrderedDict()
         self._inflight: dict[tuple[str, int, int], list[Callable[[QPixmap], None]]] = {}
+        self._decode_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumbnail-decode")
+        self._closed = False
         self.manager = QNetworkAccessManager(owner)
         self.disk_cache = QNetworkDiskCache(owner)
         self.disk_cache.setCacheDirectory(str(cache_dir))
         self.disk_cache.setMaximumCacheSize(2 * 1024 * 1024 * 1024)
         self.manager.setCache(self.disk_cache)
+        self.decodedReady.connect(self._handle_decoded)
 
     def request(self, url: str, target_size: QSize, callback: Callable[[QPixmap], None]) -> None:
-        if not url:
+        if not url or self._closed:
             return
         key = (url, max(1, target_size.width()), max(1, target_size.height()))
         cached = self._cache.get(key)
@@ -1366,24 +1384,48 @@ class ThumbnailService:
         reply.finished.connect(lambda reply=reply, key=key: self._finish(reply, key))
 
     def _finish(self, reply: QNetworkReply, key: tuple[str, int, int]) -> None:
-        callbacks = self._inflight.pop(key, [])
         try:
-            if reply.error() != QNetworkReply.NetworkError.NoError:
+            if self._closed or reply.error() != QNetworkReply.NetworkError.NoError:
+                self._inflight.pop(key, None)
                 return
-            pixmap = QPixmap()
-            if not pixmap.loadFromData(reply.readAll().data()):
-                return
-            target = QSize(key[1], key[2])
-            scaled = pixmap.scaled(
-                target,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self._remember(key, scaled)
-            for callback in callbacks:
-                callback(scaled)
+            data = bytes(reply.readAll())
+            try:
+                self._decode_pool.submit(self._decode_and_emit, key, data)
+            except RuntimeError:
+                self._inflight.pop(key, None)
         finally:
             reply.deleteLater()
+
+    def _decode_and_emit(self, key: tuple[str, int, int], data: bytes) -> None:
+        if self._closed:
+            return
+        image = QImage()
+        try:
+            decoded = QImage()
+            if decoded.loadFromData(data):
+                image = decoded.scaled(
+                    QSize(key[1], key[2]),
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.FastTransformation,
+                )
+        except Exception:
+            image = QImage()
+        if not self._closed:
+            self.decodedReady.emit(key, image)
+
+    def _handle_decoded(self, key: tuple[str, int, int], image: QImage) -> None:
+        callbacks = self._inflight.pop(key, [])
+        if self._closed or image.isNull():
+            return
+        pixmap = QPixmap.fromImage(image)
+        self._remember(key, pixmap)
+        for callback in callbacks:
+            callback(pixmap)
+
+    def shutdown(self) -> None:
+        self._closed = True
+        self._inflight.clear()
+        self._decode_pool.shutdown(wait=False, cancel_futures=True)
 
     def _remember(self, key: tuple[str, int, int], pixmap: QPixmap) -> None:
         if key in self._cache:
@@ -1527,8 +1569,14 @@ class SourceSpinBox(QSpinBox):
 class MainWindow(QMainWindow):
     catalogCountReady = Signal(int, int)
     catalogFiltersReady = Signal(int, dict)
+    catalogPageReady = Signal(int, dict, bool)
+    activeRunSnapshotReady = Signal(int, dict)
     manualDiscoveryReady = Signal(dict)
     interestDiscoveryReady = Signal(dict)
+    summaryRefreshReady = Signal(int, dict)
+    metadataBackfillReady = Signal(dict)
+    updateCheckReady = Signal(dict)
+    updateApplyReady = Signal(dict)
 
     def __init__(self, controller: AppController, services: DesktopServices) -> None:
         super().__init__()
@@ -1548,6 +1596,7 @@ class MainWindow(QMainWindow):
         self._catalog_next_cursor: str | None = None
         self._catalog_total_count = 0
         self._catalog_count_pending = False
+        self._catalog_count_exact = False
         self._catalog_loading_page = False
         self._catalog_query_generation = 0
         self._current_page_key: str | None = None
@@ -1556,16 +1605,29 @@ class MainWindow(QMainWindow):
         self._catalog_filters_generation = 0
         self._catalog_filters_loading = False
         self._catalog_filter_threads: list[threading.Thread] = []
+        self._catalog_page_threads: list[threading.Thread] = []
+        self._summary_refresh_threads: list[threading.Thread] = []
         self._manual_discovery_threads: list[threading.Thread] = []
         self._interest_discovery_threads: list[threading.Thread] = []
+        self._metadata_backfill_threads: list[threading.Thread] = []
+        self._update_threads: list[threading.Thread] = []
+        self._summary_refresh_generation = 0
+        self._summary_refresh_loading = False
+        self._summary_refresh_dirty = False
         self._manual_discovery_running = False
         self._interest_discovery_active = 0
+        self._metadata_backfill_loading = False
+        self._update_running = False
+        self._pending_update_manifest: Any | None = None
         self._catalog_has_manual_interest = False
         self._catalog_render_token = 0
         self._catalog_row_stretch_index: int | None = None
         self._catalog_layout_signature: tuple[Any, ...] | None = None
         self._catalog_batch_state: tuple[int, int, int, int, str] | None = None
         self._thumbnail_scaled_pixmaps: dict[tuple[str, int, int], QPixmap] = {}
+        self._catalog_count_threads: list[threading.Thread] = []
+        self._active_run_snapshot_threads: list[threading.Thread] = []
+        self._active_run_snapshot_loading = False
         self.topbar_quick_input: QLineEdit | None = None
         self._sources_layout_mode: str | None = None
         self._closing = False
@@ -1573,8 +1635,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(services.settings.app_title or " ")
         self.catalogCountReady.connect(self.handle_catalog_count_ready)
         self.catalogFiltersReady.connect(self.handle_catalog_filters_ready)
+        self.catalogPageReady.connect(self.handle_catalog_page_ready)
+        self.activeRunSnapshotReady.connect(self.handle_active_run_snapshot_ready)
         self.manualDiscoveryReady.connect(self.handle_manual_discovery_ready)
         self.interestDiscoveryReady.connect(self.handle_interest_discovery_ready)
+        self.summaryRefreshReady.connect(self.handle_summary_refresh_ready)
+        self.metadataBackfillReady.connect(self.handle_metadata_backfill_ready)
+        self.updateCheckReady.connect(self.handle_update_check_ready)
+        self.updateApplyReady.connect(self.handle_update_apply_ready)
         self.resize(1680, 980)
         status_bar = QStatusBar()
         status_bar.setSizeGripEnabled(False)
@@ -1638,6 +1706,12 @@ class MainWindow(QMainWindow):
 
         shell_layout.addStretch(1)
 
+        self.update_button = QPushButton("Actualizar")
+        self.update_button.setProperty("compactCatalog", "true")
+        self.update_button.setToolTip("Buscar una actualizacion de app y base de datos")
+        self.update_button.clicked.connect(self.handle_update_button)
+        shell_layout.addWidget(self.update_button)
+
         progress_box = QVBoxLayout()
         progress_box.setSpacing(3)
         progress_box.setContentsMargins(0, 0, 0, 0)
@@ -1690,6 +1764,11 @@ class MainWindow(QMainWindow):
         self.catalog_batch_timer.setSingleShot(True)
         self.catalog_batch_timer.setInterval(8)
         self.catalog_batch_timer.timeout.connect(self._continue_catalog_card_batch)
+
+        self.catalog_thumbnail_timer = QTimer(self)
+        self.catalog_thumbnail_timer.setSingleShot(True)
+        self.catalog_thumbnail_timer.setInterval(45)
+        self.catalog_thumbnail_timer.timeout.connect(self.request_visible_catalog_thumbnails)
 
         self.timer = QTimer(self)
         self.timer.setInterval(1600)
@@ -2189,9 +2268,9 @@ class MainWindow(QMainWindow):
 
         self.catalog_dub_kind = QComboBox()
         self.catalog_dub_kind.addItem("Todos los dubs", "")
-        self.catalog_dub_kind.addItem("IA", "automatic")
-        self.catalog_dub_kind.addItem("No IA", "manual")
-        self.catalog_dub_kind.setMinimumWidth(180)
+        self.catalog_dub_kind.addItem("Doblaje automático", "automatic")
+        self.catalog_dub_kind.addItem("Doblaje manual", "manual")
+        self.catalog_dub_kind.setMinimumWidth(220)
 
         self.catalog_sort = QComboBox()
         self.catalog_sort.setProperty("compactCatalog", "true")
@@ -2291,8 +2370,7 @@ class MainWindow(QMainWindow):
         filters_layout.setContentsMargins(18, 16, 18, 16)
         filters_layout.setHorizontalSpacing(14)
         filters_layout.setVerticalSpacing(12)
-        filters_layout.addWidget(inline_field("Canal", self.catalog_channel), 0, 0)
-        filters_layout.addWidget(inline_field("Búsqueda", self.catalog_source), 0, 1)
+        filters_layout.addWidget(inline_field("Canal", self.catalog_channel), 0, 0, 1, 2)
         filters_layout.addWidget(inline_field("Mostrar", self.catalog_visibility), 0, 2)
         filters_layout.addWidget(inline_field("Año de subida", self.catalog_year), 0, 3)
         filters_layout.addWidget(inline_field("Subidos desde", self.catalog_after_year), 1, 0)
@@ -2372,7 +2450,7 @@ class MainWindow(QMainWindow):
         self.catalog_view.openRequested.connect(self.open_catalog_video)
         self.catalog_view.favoriteToggled.connect(self.toggle_catalog_favorite)
         self.catalog_view.nearBottom.connect(self.load_next_catalog_page)
-        self.catalog_view.visibleRowsChanged.connect(self.request_visible_catalog_thumbnails)
+        self.catalog_view.visibleRowsChanged.connect(self.schedule_visible_catalog_thumbnails)
         catalog_grid_layout.addWidget(self.catalog_view)
         layout.addWidget(self.catalog_grid_host, 1)
 
@@ -2682,9 +2760,97 @@ class MainWindow(QMainWindow):
             f"Exploracion lista: {inspected} revisados, {verified} publicados, {related} candidatos",
             6000,
         )
-        self.refresh_catalog_filters()
+        self.request_catalog_filters_refresh()
         self.refresh_catalog()
-        self.refresh_dashboard()
+        self.request_summary_refresh()
+
+    def handle_update_button(self, *_args: object) -> None:
+        if self._update_running:
+            return
+        self._update_running = True
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Revisando...")
+
+        def worker() -> None:
+            try:
+                payload = self.controller.check_for_update()
+            except Exception as exc:
+                payload = {"error": humanize_exception(exc)}
+            self.updateCheckReady.emit(payload)
+
+        self._update_threads = [thread for thread in self._update_threads if thread.is_alive()]
+        thread = threading.Thread(target=worker, daemon=True, name="update-check")
+        self._update_threads.append(thread)
+        thread.start()
+
+    def handle_update_check_ready(self, payload: dict[str, Any]) -> None:
+        self._update_threads = [thread for thread in self._update_threads if thread.is_alive()]
+        if self._closing:
+            return
+        error = payload.get("error")
+        if error:
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            self.statusBar().showMessage(str(error), 7000)
+            return
+        if not payload.get("configured"):
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            self.statusBar().showMessage("No hay canal de actualizacion configurado.", 6000)
+            return
+        if not payload.get("update_available"):
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            self.statusBar().showMessage("Ya tienes la version mas reciente.", 6000)
+            return
+
+        manifest = payload.get("manifest")
+        if manifest is None:
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            self.statusBar().showMessage("El manifest de actualizacion no es valido.", 6000)
+            return
+
+        version = str(payload.get("version") or "")
+        answer = QMessageBox.question(
+            self,
+            "Actualizar",
+            f"Hay una actualizacion disponible ({version}). La app se cerrara, se reemplazara y se abrira de nuevo.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            return
+
+        self.update_button.setText("Descargando...")
+
+        def worker() -> None:
+            try:
+                result = self.controller.download_update_and_restart(manifest)
+            except Exception as exc:
+                result = {"error": humanize_exception(exc)}
+            self.updateApplyReady.emit(result)
+
+        thread = threading.Thread(target=worker, daemon=True, name="update-apply")
+        self._update_threads.append(thread)
+        thread.start()
+
+    def handle_update_apply_ready(self, payload: dict[str, Any]) -> None:
+        self._update_threads = [thread for thread in self._update_threads if thread.is_alive()]
+        error = payload.get("error")
+        if error:
+            self._update_running = False
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Actualizar")
+            self.statusBar().showMessage(str(error), 7000)
+            return
+        self.statusBar().showMessage("Actualizacion descargada. Reiniciando...", 3000)
+        QTimer.singleShot(200, QApplication.instance().quit)
 
     def start_interest_initial_discovery(self, seed_id: int) -> None:
         self._interest_discovery_active += 1
@@ -2729,9 +2895,9 @@ class MainWindow(QMainWindow):
             f"Busqueda inicial lista: {related} candidatos en cola",
             6000,
         )
-        self.refresh_catalog_filters()
+        self.request_catalog_filters_refresh()
         self.refresh_catalog()
-        self.refresh_dashboard()
+        self.request_summary_refresh()
 
     def toggle_dashboard_more_info(self, *_args: object) -> None:
         visible = not self.dashboard_more_info.isVisible()
@@ -2868,9 +3034,7 @@ class MainWindow(QMainWindow):
                     f.clear()
             self._catalog_has_manual_interest = True
             self.statusBar().showMessage("Interes guardado. Buscando 150 candidatos iniciales.", 4000)
-            self.refresh_sources()
-            self.refresh_runs()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             self.switch_page("catalog")
             self.refresh_catalog()
             if hasattr(self, "catalog_empty_stack"):
@@ -2901,21 +3065,18 @@ class MainWindow(QMainWindow):
                 saved_message = f"Búsqueda #{source_id} guardada"
             self.controller.set_last_max_candidates(int(self.source_max_candidates.value()))
             self.reset_source_form()
-            self.refresh_sources()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             if bool(payload["enabled"]):
                 try:
                     self.controller.run_source(source_id)
                 except Exception as exc:
-                    self.refresh_runs()
-                    self.refresh_dashboard()
+                    self.request_summary_refresh()
                     self.refresh_catalog()
                     self.statusBar().showMessage(saved_message, 4000)
                     self.show_error("Se guardó, pero no pudo empezar la revisión automática", exc)
                     return
                 self.statusBar().showMessage(f"{saved_message}. Revisando videos.", 4000)
-                self.refresh_runs()
-                self.refresh_dashboard()
+                self.request_summary_refresh()
                 self.refresh_catalog()
             else:
                 self.statusBar().showMessage(saved_message, 4000)
@@ -2942,8 +3103,7 @@ class MainWindow(QMainWindow):
             else:
                 self.statusBar().showMessage("Busquedas borradas. Videos conservados.", 4000)
             self.reset_source_form()
-            self.refresh_sources()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             self.refresh_catalog()
         except Exception as exc:
             self.show_error("No se pudieron borrar las busquedas", exc)
@@ -3014,8 +3174,7 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.StandardButton.Yes:
                     return
             self.controller.toggle_source(source["id"])
-            self.refresh_sources()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             state = "pausada" if source["enabled"] else "reactivada"
             self.statusBar().showMessage(f"Búsqueda {state}: {source['label']}", 4000)
         except Exception as exc:
@@ -3024,8 +3183,9 @@ class MainWindow(QMainWindow):
     def increase_full_source_limits(self, *_args: object) -> None:
         try:
             changed = self.controller.increase_full_source_limits(500)
-            self.refresh_sources()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
+            if changed:
+                self.source_increase_limit_button.hide()
             if changed:
                 self.statusBar().showMessage(
                     f"Límite aumentado en 500 para {changed} fuente{'s' if changed != 1 else ''}",
@@ -3044,8 +3204,7 @@ class MainWindow(QMainWindow):
         try:
             self.controller.run_source(source["id"])
             self.statusBar().showMessage(f"Búsqueda iniciada para “{source['label']}”", 4000)
-            self.refresh_runs()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             self.refresh_catalog()
         except Exception as exc:
             self.show_error("No se pudo iniciar la búsqueda", exc)
@@ -3054,8 +3213,7 @@ class MainWindow(QMainWindow):
         try:
             self.controller.run_all()
             self.statusBar().showMessage("Búsqueda iniciada para todas tus búsquedas activas", 4000)
-            self.refresh_runs()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             self.refresh_catalog()
         except Exception as exc:
             self.show_error("No se pudo iniciar la búsqueda general", exc)
@@ -3114,7 +3272,13 @@ class MainWindow(QMainWindow):
         table.resizeColumnsToContents()
 
     def update_topbar_status(self) -> None:
-        active_run = self.controller.active_run_snapshot()
+        active_run_id = self.controller.active_run_id()
+        if active_run_id is None:
+            self.apply_topbar_status(None)
+        else:
+            self.request_active_run_snapshot(active_run_id)
+
+    def apply_topbar_status(self, active_run: dict[str, Any] | None) -> None:
         source_lookup = {int(source["id"]): source["label"] for source in self._source_rows}
         if active_run:
             scope = pretty_run_scope(active_run["scope"], source_lookup)
@@ -3140,24 +3304,76 @@ class MainWindow(QMainWindow):
         else:
             self.topbar_status_label.setText("Aún no has buscado videos")
 
+    def request_active_run_snapshot(self, active_run_id: int) -> None:
+        if self._active_run_snapshot_loading or self._closing:
+            return
+        self._active_run_snapshot_loading = True
+
+        def worker() -> None:
+            try:
+                run = self.controller.active_run_snapshot()
+            except Exception:
+                run = None
+            self.activeRunSnapshotReady.emit(active_run_id, {"run": run})
+
+        self._active_run_snapshot_threads = [
+            thread for thread in self._active_run_snapshot_threads if thread.is_alive()
+        ]
+        thread = threading.Thread(target=worker, daemon=True, name=f"active-run-{active_run_id}")
+        self._active_run_snapshot_threads.append(thread)
+        thread.start()
+
+    def handle_active_run_snapshot_ready(self, active_run_id: int, payload: dict[str, Any]) -> None:
+        self._active_run_snapshot_threads = [
+            thread for thread in self._active_run_snapshot_threads if thread.is_alive()
+        ]
+        self._active_run_snapshot_loading = False
+        if self._closing or self.controller.active_run_id() != active_run_id:
+            return
+        run = payload.get("run")
+        self.apply_topbar_status(run if isinstance(run, dict) else None)
+
     def refresh_all(self, *_args: object) -> None:
-        self.refresh_sources()
-        self.refresh_dashboard()
-        self.refresh_runs()
+        self.request_summary_refresh()
         self._catalog_dirty = True
         if self._current_page_key == "catalog":
             self.refresh_catalog()
 
+    def invalidate_summary_refresh(self) -> None:
+        self._summary_refresh_generation += 1
+        self._summary_refresh_loading = False
+        self._summary_refresh_dirty = False
+
     def refresh_dashboard(self, *_args: object) -> None:
+        self.invalidate_summary_refresh()
         stats = self.controller.dashboard_stats()
+        latest_runs = self.controller.list_runs(limit=5)
+        self.apply_dashboard_stats(stats, latest_runs=latest_runs)
+
+    def apply_dashboard_stats(self, stats: dict[str, Any], *, latest_runs: list[dict[str, Any]] | None = None) -> None:
         self._latest_stats = stats
-        self.update_topbar_status()
-        self._populate_runs_table(self.latest_runs_table, self.controller.list_runs(limit=5), "latest")
+        active_run_id = self.controller.active_run_id()
+        if active_run_id is None:
+            self.apply_topbar_status(None)
+        else:
+            self.request_active_run_snapshot(active_run_id)
+        if latest_runs is not None:
+            self._populate_runs_table(self.latest_runs_table, latest_runs[:5], "latest")
         self._update_dashboard_stats(stats)
 
     def refresh_sources(self, *_args: object) -> None:
+        self.invalidate_summary_refresh()
         selected_source_ids = {int(source["id"]) for source in self.selected_sources()}
-        self._source_rows = self.controller.list_sources()
+        self.apply_source_rows(self.controller.list_sources(), selected_source_ids=selected_source_ids)
+
+    def apply_source_rows(
+        self,
+        source_rows: list[dict[str, Any]],
+        *,
+        selected_source_ids: set[int] | None = None,
+    ) -> None:
+        selected_source_ids = set() if selected_source_ids is None else selected_source_ids
+        self._source_rows = source_rows
         editing_source_id = self._editing_source_id
         full_sources = [source for source in self._source_rows if source_is_full(source)]
         self.source_increase_limit_button.setVisible(bool(full_sources))
@@ -3209,10 +3425,81 @@ class MainWindow(QMainWindow):
         self.update_source_actions()
 
     def refresh_runs(self, *_args: object) -> None:
-        self._run_rows = self.controller.list_runs(limit=100)
+        self.invalidate_summary_refresh()
+        self.apply_run_rows(self.controller.list_runs(limit=100))
+
+    def apply_run_rows(self, run_rows: list[dict[str, Any]]) -> None:
+        self._run_rows = run_rows
+        self._populate_runs_table(self.latest_runs_table, self._run_rows[:5], "latest")
         self._populate_runs_table(self.runs_table, self._run_rows, "runs")
         self._populate_runs_table(self.sources_recent_runs_table, self._run_rows[:3], "recent")
         self._populate_runs_table(self.sources_full_history_table, self._run_rows, "full")
+
+    def request_summary_refresh(self, *_args: object) -> None:
+        if self._closing or not self.services.settings.db_path.parent.exists():
+            return
+        if self._summary_refresh_loading:
+            self._summary_refresh_dirty = True
+            return
+
+        self._summary_refresh_generation += 1
+        generation = self._summary_refresh_generation
+        selected_source_ids = {int(source["id"]) for source in self.selected_sources()}
+        self._summary_refresh_loading = True
+        self._summary_refresh_dirty = False
+
+        def worker() -> None:
+            payload: dict[str, Any]
+            try:
+                sources = self.controller.list_sources()
+                runs = self.controller.list_runs(limit=100)
+                stats = self.controller.dashboard_stats()
+                payload = {
+                    "sources": sources,
+                    "runs": runs,
+                    "stats": stats,
+                    "selected_source_ids": selected_source_ids,
+                }
+            except Exception as exc:
+                payload = {"error": humanize_exception(exc)}
+            self.summaryRefreshReady.emit(generation, payload)
+
+        self._summary_refresh_threads = [
+            thread for thread in self._summary_refresh_threads if thread.is_alive()
+        ]
+        thread = threading.Thread(target=worker, daemon=True, name=f"summary-refresh-{generation}")
+        self._summary_refresh_threads.append(thread)
+        thread.start()
+
+    def handle_summary_refresh_ready(self, generation: int, payload: dict[str, Any]) -> None:
+        self._summary_refresh_threads = [
+            thread for thread in self._summary_refresh_threads if thread.is_alive()
+        ]
+        if generation != self._summary_refresh_generation:
+            return
+        self._summary_refresh_loading = False
+        if self._closing:
+            return
+        error = payload.get("error")
+        if error:
+            self.statusBar().showMessage(str(error), 6000)
+        else:
+            source_rows = payload.get("sources")
+            run_rows = payload.get("runs")
+            stats = payload.get("stats")
+            selected_source_ids = payload.get("selected_source_ids")
+            if not isinstance(selected_source_ids, set):
+                selected_source_ids = set()
+            if isinstance(source_rows, list):
+                self.apply_source_rows(source_rows, selected_source_ids=selected_source_ids)
+            if isinstance(run_rows, list):
+                self.apply_run_rows(run_rows)
+            if isinstance(stats, dict):
+                self.apply_dashboard_stats(stats, latest_runs=run_rows if isinstance(run_rows, list) else None)
+
+        if self._summary_refresh_dirty:
+            self._summary_refresh_dirty = False
+            QTimer.singleShot(0, self.request_summary_refresh)
 
     def refresh_catalog_filters(self, *_args: object) -> None:
         if self._closing or not self.services.settings.db_path.parent.exists():
@@ -3233,6 +3520,7 @@ class MainWindow(QMainWindow):
         generation = self._catalog_filters_generation
         source_rows = list(self._source_rows)
         self._catalog_filters_loading = True
+        self._catalog_filters_dirty = False
 
         def worker() -> None:
             try:
@@ -3260,7 +3548,10 @@ class MainWindow(QMainWindow):
         source_rows = payload.get("source_rows")
         if not isinstance(source_rows, list):
             source_rows = self._source_rows
+        should_refresh_again = self._catalog_filters_dirty
         self._apply_catalog_filters(filters, source_rows)
+        if should_refresh_again:
+            QTimer.singleShot(0, self.request_catalog_filters_refresh)
 
     def _apply_catalog_filters(
         self,
@@ -3338,14 +3629,14 @@ class MainWindow(QMainWindow):
 
     def update_catalog_surface(self) -> None:
         total_videos = int(self._latest_stats.get("total_videos", 0))
-        active_run = self.controller.active_run_snapshot()
+        active_run_id = self.controller.active_run_id()
         active_discovery = (
-            bool(active_run)
+            active_run_id is not None
             or self._manual_discovery_running
             or self._interest_discovery_active > 0
             or self._catalog_has_manual_interest
         )
-        has_videos = total_videos > 0
+        has_videos = total_videos > 0 or bool(self._catalog_rows)
 
         self.catalog_controls_shell.setVisible(has_videos)
         self.catalog_grid_host.setVisible(has_videos)
@@ -3387,30 +3678,86 @@ class MainWindow(QMainWindow):
         self._catalog_loading_page = False
         self._catalog_next_cursor = None
         self._catalog_count_pending = False
+        self._catalog_count_exact = False
         self._catalog_total_count = 0
         self._catalog_rows = []
+        self._catalog_loading_page = True
         if hasattr(self, "catalog_model"):
             self.catalog_model.set_items([])
             self._sync_catalog_card_compat_widgets()
             self.update_catalog_results_count()
-        page = self.controller.list_catalog_page(
-            lang=filters["lang"],
-            source_id=filters["source_id"],
-            channel=filters["channel"],
-            query=filters["query"],
-            only_dubbed=filters["only_dubbed"],
-            only_favorites=filters["only_favorites"],
-            dub_kind=filters["dub_kind"],
-            sort_by=filters["sort_by"],
-            year=filters["year"],
-            year_after=filters["year_after"],
-            year_before=filters["year_before"],
-            page_size=CATALOG_PAGE_SIZE,
-            cursor=None,
+        self.start_catalog_page_worker(generation, filters, cursor=None, append=False)
+
+    def start_catalog_page_worker(
+        self,
+        generation: int,
+        filters: dict[str, Any],
+        *,
+        cursor: str | None,
+        append: bool,
+    ) -> None:
+        def worker() -> None:
+            payload: dict[str, Any]
+            try:
+                payload = self.controller.list_catalog_page(
+                    lang=filters.get("lang"),
+                    source_id=filters.get("source_id"),
+                    channel=filters.get("channel"),
+                    query=filters.get("query"),
+                    only_dubbed=bool(filters.get("only_dubbed")),
+                    only_favorites=bool(filters.get("only_favorites")),
+                    dub_kind=str(filters.get("dub_kind") or ""),
+                    sort_by=str(filters.get("sort_by") or "recent"),
+                    year=filters.get("year"),
+                    year_after=filters.get("year_after"),
+                    year_before=filters.get("year_before"),
+                    page_size=CATALOG_PAGE_SIZE,
+                    cursor=cursor,
+                )
+            except Exception as exc:
+                payload = {"items": [], "next_cursor": None, "error": humanize_exception(exc)}
+            self.catalogPageReady.emit(generation, payload, append)
+
+        self._catalog_page_threads = [thread for thread in self._catalog_page_threads if thread.is_alive()]
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"catalog-page-{generation}-{'append' if append else 'initial'}",
         )
-        rows = list(page["items"])
+        self._catalog_page_threads.append(thread)
+        thread.start()
+
+    def handle_catalog_page_ready(self, generation: int, page: dict[str, Any], append: bool) -> None:
+        self._catalog_page_threads = [thread for thread in self._catalog_page_threads if thread.is_alive()]
+        if generation != self._catalog_query_generation or self._closing:
+            return
+        self._catalog_loading_page = False
+        error = page.get("error")
+        if error:
+            self.statusBar().showMessage(str(error), 6000)
+            if not append:
+                self.update_catalog_surface()
+            return
+
+        rows = list(page.get("items") or [])
         self._catalog_next_cursor = page.get("next_cursor")
+        if append:
+            if rows:
+                self._catalog_rows.extend(rows)
+                self.catalog_model.append_items(rows)
+                self._sync_catalog_card_compat_widgets()
+                self.schedule_visible_catalog_thumbnails()
+            if self._catalog_count_exact:
+                self._catalog_count_pending = False
+            else:
+                self._catalog_count_pending = bool(self._catalog_next_cursor)
+                self._catalog_total_count = len(self._catalog_rows)
+                self._catalog_count_exact = not self._catalog_count_pending
+            self.update_catalog_results_count()
+            return
+
         self._catalog_count_pending = bool(self._catalog_next_cursor)
+        self._catalog_count_exact = not self._catalog_count_pending
         self._catalog_total_count = len(rows)
         signature = (
             self._catalog_total_count,
@@ -3439,8 +3786,22 @@ class MainWindow(QMainWindow):
             self.update_catalog_surface()
         else:
             self.render_catalog_cards()
-        if self._catalog_count_pending:
-            self.start_catalog_count_worker(generation, filters)
+        if self._catalog_count_pending and self.should_count_catalog_exactly(dict(self._catalog_filter_state)):
+            self.start_catalog_count_worker(generation, dict(self._catalog_filter_state))
+
+    def should_count_catalog_exactly(self, filters: dict[str, Any]) -> bool:
+        total_videos = int(self._latest_stats.get("total_videos") or 0)
+        if total_videos <= CATALOG_BACKGROUND_COUNT_MAX_VIDEOS:
+            return True
+        return bool(
+            filters.get("query")
+            or filters.get("source_id")
+            or filters.get("channel")
+            or filters.get("only_favorites")
+            or filters.get("year")
+            or filters.get("year_after")
+            or filters.get("year_before")
+        )
 
     def start_catalog_count_worker(self, generation: int, filters: dict[str, Any]) -> None:
         def worker() -> None:
@@ -3461,13 +3822,17 @@ class MainWindow(QMainWindow):
                 return
             self.catalogCountReady.emit(generation, count)
 
-        threading.Thread(target=worker, daemon=True, name=f"catalog-count-{generation}").start()
+        self._catalog_count_threads = [thread for thread in self._catalog_count_threads if thread.is_alive()]
+        thread = threading.Thread(target=worker, daemon=True, name=f"catalog-count-{generation}")
+        self._catalog_count_threads.append(thread)
+        thread.start()
 
     def handle_catalog_count_ready(self, generation: int, count: int) -> None:
         if generation != self._catalog_query_generation:
             return
         self._catalog_total_count = count
         self._catalog_count_pending = False
+        self._catalog_count_exact = True
         self.update_catalog_results_count()
 
     def load_next_catalog_page(self) -> None:
@@ -3479,44 +3844,49 @@ class MainWindow(QMainWindow):
         generation = self._catalog_query_generation
         filters = dict(self._catalog_filter_state)
         cursor = self._catalog_next_cursor
-        page = self.controller.list_catalog_page(
-            lang=filters.get("lang"),
-            source_id=filters.get("source_id"),
-            channel=filters.get("channel"),
-            query=filters.get("query"),
-            only_dubbed=bool(filters.get("only_dubbed")),
-            only_favorites=bool(filters.get("only_favorites")),
-            dub_kind=str(filters.get("dub_kind") or ""),
-            sort_by=str(filters.get("sort_by") or "recent"),
-            year=filters.get("year"),
-            year_after=filters.get("year_after"),
-            year_before=filters.get("year_before"),
-            page_size=CATALOG_PAGE_SIZE,
-            cursor=cursor,
-        )
-        if generation != self._catalog_query_generation:
-            self._catalog_loading_page = False
-            return
-        rows = list(page["items"])
-        self._catalog_next_cursor = page.get("next_cursor")
-        if rows:
-            self._catalog_rows.extend(rows)
-            self.catalog_model.append_items(rows)
-            self._sync_catalog_card_compat_widgets()
-            QTimer.singleShot(0, self.request_visible_catalog_thumbnails)
-        self._catalog_loading_page = False
+        self.start_catalog_page_worker(generation, filters, cursor=cursor, append=True)
 
     def start_metadata_backfill_if_needed(self) -> None:
-        if self.controller.count_videos_missing_metadata() <= 0:
+        if self._metadata_backfill_loading or self._closing:
             return
-        run_id = self.controller.start_metadata_backfill(
-            limit=int(getattr(self.services.settings, "startup_metadata_backfill_limit", 80))
-        )
+        self._metadata_backfill_loading = True
+
+        def worker() -> None:
+            payload: dict[str, Any]
+            try:
+                run_id = None
+                if self.controller.count_videos_missing_metadata() > 0:
+                    run_id = self.controller.start_metadata_backfill(
+                        limit=int(getattr(self.services.settings, "startup_metadata_backfill_limit", 80))
+                    )
+                payload = {"run_id": run_id}
+            except Exception as exc:
+                payload = {"error": humanize_exception(exc)}
+            self.metadataBackfillReady.emit(payload)
+
+        self._metadata_backfill_threads = [
+            thread for thread in self._metadata_backfill_threads if thread.is_alive()
+        ]
+        thread = threading.Thread(target=worker, daemon=True, name="metadata-backfill-check")
+        self._metadata_backfill_threads.append(thread)
+        thread.start()
+
+    def handle_metadata_backfill_ready(self, payload: dict[str, Any]) -> None:
+        self._metadata_backfill_threads = [
+            thread for thread in self._metadata_backfill_threads if thread.is_alive()
+        ]
+        self._metadata_backfill_loading = False
+        if self._closing:
+            return
+        error = payload.get("error")
+        if error:
+            self.statusBar().showMessage(str(error), 6000)
+            return
+        run_id = payload.get("run_id")
         if run_id is None:
             return
         self.statusBar().showMessage("Actualizando datos de videos ya encontrados", 4000)
-        self.refresh_runs()
-        self.refresh_dashboard()
+        self.request_summary_refresh()
 
     def render_catalog_cards_if_visible(self) -> None:
         if self._current_page_key != "catalog":
@@ -3555,7 +3925,7 @@ class MainWindow(QMainWindow):
             self.catalog_empty_results_label.hide()
         self.catalog_grid_host.setStyleSheet("QWidget#catalogGridHost { background: transparent; border: none; }")
         self.catalog_view.setVisible(True)
-        QTimer.singleShot(0, self.request_visible_catalog_thumbnails)
+        self.schedule_visible_catalog_thumbnails()
 
     def _continue_catalog_card_batch(self) -> None:
         return
@@ -3578,6 +3948,10 @@ class MainWindow(QMainWindow):
             card.show()
             self._catalog_card_widgets.append(card)
 
+    def schedule_visible_catalog_thumbnails(self) -> None:
+        if hasattr(self, "catalog_thumbnail_timer") and not self._closing:
+            self.catalog_thumbnail_timer.start()
+
     def request_visible_catalog_thumbnails(self) -> None:
         if not hasattr(self, "catalog_view") or not self.catalog_view.isVisible():
             return
@@ -3585,14 +3959,17 @@ class MainWindow(QMainWindow):
         if model.rowCount() == 0:
             return
         viewport = self.catalog_view.viewport()
-        top = max(0, viewport.rect().top() - viewport.height() * 2)
-        bottom = viewport.rect().bottom() + viewport.height() * 2
+        top = max(0, viewport.rect().top() - viewport.height())
+        bottom = viewport.rect().bottom() + viewport.height()
         first = self.catalog_view.indexAt(QPoint(8, max(8, top)))
         last = self.catalog_view.indexAt(QPoint(max(8, viewport.width() - 8), max(8, bottom)))
         first_row = first.row() if first.isValid() else 0
-        last_row = last.row() if last.isValid() else min(model.rowCount() - 1, first_row + 80)
-        last_row = min(model.rowCount() - 1, max(last_row, first_row + 80))
-        target_size = QSize(self.catalog_delegate.card_width, self.catalog_delegate.thumbnail_height())
+        last_row = last.row() if last.isValid() else min(model.rowCount() - 1, first_row + CATALOG_THUMBNAIL_PREFETCH_ROWS)
+        last_row = min(model.rowCount() - 1, max(last_row, first_row + CATALOG_THUMBNAIL_PREFETCH_ROWS))
+        target_size = QSize(
+            max(96, int(self.catalog_delegate.card_width * THUMBNAIL_RENDER_SCALE)),
+            max(54, int(self.catalog_delegate.thumbnail_height() * THUMBNAIL_RENDER_SCALE)),
+        )
         generation = self._catalog_query_generation
         for row in range(first_row, last_row + 1):
             item = model.item_at(row)
@@ -3637,17 +4014,14 @@ class MainWindow(QMainWindow):
         if active_run_id is not None:
             if self._last_active_run_id is None:
                 self._last_active_run_id = active_run_id
-                self.refresh_runs()
-                self.refresh_dashboard()
+                self.request_summary_refresh()
             else:
-                self.update_topbar_status()
+                self.request_active_run_snapshot(active_run_id)
             return
 
         if self._last_active_run_id is not None:
             self._last_active_run_id = None
-            self.refresh_sources()
-            self.refresh_runs()
-            self.refresh_dashboard()
+            self.request_summary_refresh()
             if self._current_page_key == "catalog":
                 self.refresh_catalog()
             else:
@@ -3670,6 +4044,7 @@ class MainWindow(QMainWindow):
             "catalog_relayout_timer",
             "catalog_page_refresh_timer",
             "catalog_batch_timer",
+            "catalog_thumbnail_timer",
             "startup_backfill_timer",
             "timer",
         ):
@@ -3678,10 +4053,32 @@ class MainWindow(QMainWindow):
                 timer.stop()
         if self.services.discovery_loop is not None:
             self.services.discovery_loop.stop()
+        if hasattr(self, "thumbnail_service"):
+            self.thumbnail_service.shutdown()
         for thread in list(self._catalog_filter_threads):
             if thread.is_alive():
                 thread.join(timeout=2.0)
         self._catalog_filter_threads = [thread for thread in self._catalog_filter_threads if thread.is_alive()]
+        for thread in list(self._catalog_page_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._catalog_page_threads = [thread for thread in self._catalog_page_threads if thread.is_alive()]
+        for thread in list(self._summary_refresh_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._summary_refresh_threads = [
+            thread for thread in self._summary_refresh_threads if thread.is_alive()
+        ]
+        for thread in list(self._catalog_count_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._catalog_count_threads = [thread for thread in self._catalog_count_threads if thread.is_alive()]
+        for thread in list(self._active_run_snapshot_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._active_run_snapshot_threads = [
+            thread for thread in self._active_run_snapshot_threads if thread.is_alive()
+        ]
         for thread in list(self._manual_discovery_threads):
             if thread.is_alive():
                 thread.join(timeout=2.0)
@@ -3692,6 +4089,16 @@ class MainWindow(QMainWindow):
         self._interest_discovery_threads = [
             thread for thread in self._interest_discovery_threads if thread.is_alive()
         ]
+        for thread in list(self._metadata_backfill_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._metadata_backfill_threads = [
+            thread for thread in self._metadata_backfill_threads if thread.is_alive()
+        ]
+        for thread in list(self._update_threads):
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self._update_threads = [thread for thread in self._update_threads if thread.is_alive()]
         super().closeEvent(event)
 
     def show_error(self, title: str, error: Exception) -> None:

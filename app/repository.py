@@ -433,8 +433,16 @@ class Repository:
                 (INTERNAL_DISCOVERY_SOURCE_VALUE,),
             ).fetchone()[0]
             total_videos = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+            clauses, params = self._catalog_clauses(
+                lang=SPANISH_LANGUAGE_FILTER,
+                source_id=None,
+                channel=None,
+                query=None,
+                only_dubbed=True,
+            )
             dubbed_videos = conn.execute(
-                "SELECT COUNT(*) FROM videos WHERE has_dubbing = 1"
+                f"SELECT COUNT(*) FROM videos v WHERE {' AND '.join(clauses)}",
+                params,
             ).fetchone()[0]
             latest_run = conn.execute(
                 "SELECT * FROM scrape_runs ORDER BY id DESC LIMIT 1"
@@ -452,18 +460,13 @@ class Repository:
                 """
                 SELECT
                     s.*,
-                    COALESCE(source_counts.video_count, stats.video_count, 0) AS video_count,
+                    COALESCE(stats.video_count, 0) AS video_count,
                     CASE
-                        WHEN COALESCE(source_counts.video_count, stats.video_count, 0) >= s.max_candidates_per_run THEN 1
+                        WHEN COALESCE(stats.video_count, 0) >= s.max_candidates_per_run THEN 1
                         ELSE 0
                     END AS is_full
                 FROM sources s
                 LEFT JOIN source_stats stats ON stats.source_id = s.id
-                LEFT JOIN (
-                    SELECT source_id, COUNT(*) AS video_count
-                    FROM video_sources
-                    GROUP BY source_id
-                ) source_counts ON source_counts.source_id = s.id
                 WHERE s.value != ?
                 ORDER BY s.enabled DESC, s.updated_at DESC, s.id DESC
                 """
@@ -580,12 +583,8 @@ class Repository:
                 """
                 SELECT s.id
                 FROM sources s
-                LEFT JOIN (
-                    SELECT source_id, COUNT(*) AS video_count
-                    FROM video_sources
-                    GROUP BY source_id
-                ) source_counts ON source_counts.source_id = s.id
-                WHERE COALESCE(source_counts.video_count, 0) >= s.max_candidates_per_run
+                LEFT JOIN source_stats stats ON stats.source_id = s.id
+                WHERE COALESCE(stats.video_count, 0) >= s.max_candidates_per_run
                 """
             ).fetchall()
             source_ids = [int(row["id"]) for row in rows]
@@ -676,36 +675,59 @@ class Repository:
         priority: int = 100,
         enabled: bool = True,
     ) -> int:
+        seed_ids = self.create_discovery_seeds_batch(
+            [
+                {
+                    "seed_kind": seed_kind,
+                    "source_type": source_type,
+                    "label": label,
+                    "value": value,
+                    "priority": priority,
+                    "enabled": enabled,
+                }
+            ]
+        )
+        return seed_ids[0]
+
+    def create_discovery_seeds_batch(self, seeds: list[dict[str, Any]]) -> list[int]:
+        if not seeds:
+            return []
         timestamp = to_iso()
+        seed_ids: list[int] = []
         with self.db.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO discovery_seeds(
-                    seed_kind, source_type, label, value, enabled, priority,
-                    next_discovery_at, created_at, updated_at
+            for seed in seeds:
+                value = str(seed.get("value") or "").strip()
+                if not value:
+                    continue
+                cursor = conn.execute(
+                    """
+                    INSERT INTO discovery_seeds(
+                        seed_kind, source_type, label, value, enabled, priority,
+                        next_discovery_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(seed_kind, value) DO UPDATE SET
+                        label = excluded.label,
+                        enabled = excluded.enabled,
+                        priority = MIN(discovery_seeds.priority, excluded.priority),
+                        next_discovery_at = COALESCE(discovery_seeds.next_discovery_at, excluded.next_discovery_at),
+                        updated_at = excluded.updated_at
+                    RETURNING id
+                    """,
+                    (
+                        str(seed.get("seed_kind") or "related_video"),
+                        str(seed.get("source_type") or "video"),
+                        str(seed.get("label") or value),
+                        value,
+                        1 if bool(seed.get("enabled", True)) else 0,
+                        int(seed.get("priority") or 100),
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(seed_kind, value) DO UPDATE SET
-                    label = excluded.label,
-                    enabled = excluded.enabled,
-                    priority = MIN(discovery_seeds.priority, excluded.priority),
-                    next_discovery_at = COALESCE(discovery_seeds.next_discovery_at, excluded.next_discovery_at),
-                    updated_at = excluded.updated_at
-                RETURNING id
-                """,
-                (
-                    seed_kind,
-                    source_type,
-                    label,
-                    value,
-                    1 if enabled else 0,
-                    int(priority),
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            return int(cursor.fetchone()["id"])
+                seed_ids.append(int(cursor.fetchone()["id"]))
+        return seed_ids
 
     def import_content_pool(self, pool_path: Path, *, version: str) -> dict[str, Any]:
         if not pool_path.exists():
@@ -989,130 +1011,178 @@ class Repository:
         priority: int = 100,
         score: float = 0,
     ) -> None:
-        video_id = str(candidate.get("video_id") or "").strip()
-        if not video_id:
-            return
+        self.enqueue_candidates_batch(
+            [candidate],
+            source_seed_id=source_seed_id,
+            discovered_from_video_id=discovered_from_video_id,
+            priority=priority,
+            score=score,
+        )
+
+    def enqueue_candidates_batch(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        source_seed_id: int | None = None,
+        discovered_from_video_id: str | None = None,
+        priority: int = 100,
+        score: float = 0,
+    ) -> int:
+        if not candidates:
+            return 0
         timestamp = to_iso()
-        title = str(candidate.get("title") or video_id)
+        inserted = 0
         with self.db.connect() as conn:
             source_id = self._ensure_internal_discovery_source(conn)
-            parsed_view_count = candidate.get("view_count")
-            try:
-                view_count = int(parsed_view_count) if parsed_view_count is not None else None
-            except (TypeError, ValueError):
-                view_count = None
-            parsed_duration = candidate.get("duration_seconds")
-            try:
-                duration_seconds = int(parsed_duration) if parsed_duration is not None else None
-            except (TypeError, ValueError):
-                duration_seconds = None
-            published_at = candidate.get("published_at")
-            year = published_year(str(published_at) if published_at else None)
-            view_sort = view_count if view_count is not None else -1
+            for candidate in candidates:
+                if self._enqueue_candidate_on_conn(
+                    conn,
+                    candidate,
+                    source_id=source_id,
+                    timestamp=timestamp,
+                    source_seed_id=source_seed_id,
+                    discovered_from_video_id=discovered_from_video_id,
+                    priority=priority,
+                    score=score,
+                ):
+                    inserted += 1
+            if inserted:
+                self._sync_source_stats(conn, [source_id])
+        return inserted
+
+    def _enqueue_candidate_on_conn(
+        self,
+        conn: Any,
+        candidate: dict[str, Any],
+        *,
+        source_id: int,
+        timestamp: str,
+        source_seed_id: int | None,
+        discovered_from_video_id: str | None,
+        priority: int,
+        score: float,
+    ) -> bool:
+        video_id = str(candidate.get("video_id") or "").strip()
+        if not video_id:
+            return False
+        title = str(candidate.get("title") or video_id)
+        parsed_view_count = candidate.get("view_count")
+        try:
+            view_count = int(parsed_view_count) if parsed_view_count is not None else None
+        except (TypeError, ValueError):
+            view_count = None
+        parsed_duration = candidate.get("duration_seconds")
+        try:
+            duration_seconds = int(parsed_duration) if parsed_duration is not None else None
+        except (TypeError, ValueError):
+            duration_seconds = None
+        published_at = candidate.get("published_at")
+        year = published_year(str(published_at) if published_at else None)
+        view_sort = view_count if view_count is not None else -1
+        conn.execute(
+            """
+            INSERT INTO videos (
+                video_id, title, channel, channel_id, duration_seconds, thumbnail_url,
+                published_at, view_count, has_dubbing, audio_languages_json, audio_language_count,
+                catalog_visible, published_year, view_count_sort, metadata_complete, metadata_sort_at,
+                random_key, last_seen_at, last_checked_at, inspect_status, inspect_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, 0, ?,
+                    ABS(RANDOM()) / 9223372036854775807.0, ?, NULL, 'pending', NULL)
+            ON CONFLICT(video_id) DO UPDATE SET
+                title = COALESCE(excluded.title, videos.title),
+                channel = COALESCE(excluded.channel, videos.channel),
+                channel_id = COALESCE(excluded.channel_id, videos.channel_id),
+                duration_seconds = COALESCE(excluded.duration_seconds, videos.duration_seconds),
+                thumbnail_url = COALESCE(excluded.thumbnail_url, videos.thumbnail_url),
+                published_at = COALESCE(excluded.published_at, videos.published_at),
+                view_count = COALESCE(excluded.view_count, videos.view_count),
+                published_year = COALESCE(excluded.published_year, videos.published_year),
+                view_count_sort = CASE
+                    WHEN excluded.view_count IS NOT NULL THEN excluded.view_count_sort
+                    ELSE videos.view_count_sort
+                END,
+                metadata_sort_at = excluded.metadata_sort_at,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                video_id,
+                title,
+                candidate.get("channel"),
+                candidate.get("channel_id"),
+                duration_seconds,
+                candidate.get("thumbnail_url"),
+                published_at,
+                view_count,
+                year,
+                view_sort,
+                timestamp,
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO video_sources(source_id, video_id, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_id, video_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+            """,
+            (source_id, video_id, timestamp, timestamp),
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_frontier(
+                video_id, title, channel, channel_id, duration_seconds, thumbnail_url,
+                published_at, view_count, state, priority, score, attempts, not_before,
+                source_seed_id, discovered_from_video_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?)
+            ON CONFLICT(video_id) DO UPDATE SET
+                title = COALESCE(excluded.title, candidate_frontier.title),
+                channel = COALESCE(excluded.channel, candidate_frontier.channel),
+                channel_id = COALESCE(excluded.channel_id, candidate_frontier.channel_id),
+                duration_seconds = COALESCE(excluded.duration_seconds, candidate_frontier.duration_seconds),
+                thumbnail_url = COALESCE(excluded.thumbnail_url, candidate_frontier.thumbnail_url),
+                published_at = COALESCE(excluded.published_at, candidate_frontier.published_at),
+                view_count = COALESCE(excluded.view_count, candidate_frontier.view_count),
+                state = CASE
+                    WHEN candidate_frontier.state IN ('verified', 'rejected') THEN candidate_frontier.state
+                    ELSE 'queued'
+                END,
+                priority = MIN(candidate_frontier.priority, excluded.priority),
+                score = MAX(candidate_frontier.score, excluded.score),
+                not_before = MIN(candidate_frontier.not_before, excluded.not_before),
+                source_seed_id = COALESCE(excluded.source_seed_id, candidate_frontier.source_seed_id),
+                discovered_from_video_id = COALESCE(excluded.discovered_from_video_id, candidate_frontier.discovered_from_video_id),
+                updated_at = excluded.updated_at
+            """,
+            (
+                video_id,
+                title,
+                candidate.get("channel"),
+                candidate.get("channel_id"),
+                duration_seconds,
+                candidate.get("thumbnail_url"),
+                published_at,
+                view_count,
+                int(priority),
+                float(score),
+                timestamp,
+                source_seed_id,
+                discovered_from_video_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        if discovered_from_video_id:
             conn.execute(
                 """
-                INSERT INTO videos (
-                    video_id, title, channel, channel_id, duration_seconds, thumbnail_url,
-                    published_at, view_count, has_dubbing, audio_languages_json, audio_language_count,
-                    catalog_visible, published_year, view_count_sort, metadata_complete, metadata_sort_at,
-                    random_key, last_seen_at, last_checked_at, inspect_status, inspect_error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, 0, ?,
-                        ABS(RANDOM()) / 9223372036854775807.0, ?, NULL, 'pending', NULL)
-                ON CONFLICT(video_id) DO UPDATE SET
-                    title = COALESCE(excluded.title, videos.title),
-                    channel = COALESCE(excluded.channel, videos.channel),
-                    channel_id = COALESCE(excluded.channel_id, videos.channel_id),
-                    duration_seconds = COALESCE(excluded.duration_seconds, videos.duration_seconds),
-                    thumbnail_url = COALESCE(excluded.thumbnail_url, videos.thumbnail_url),
-                    published_at = COALESCE(excluded.published_at, videos.published_at),
-                    view_count = COALESCE(excluded.view_count, videos.view_count),
-                    published_year = COALESCE(excluded.published_year, videos.published_year),
-                    view_count_sort = CASE
-                        WHEN excluded.view_count IS NOT NULL THEN excluded.view_count_sort
-                        ELSE videos.view_count_sort
-                    END,
-                    metadata_sort_at = excluded.metadata_sort_at,
-                    last_seen_at = excluded.last_seen_at
+                INSERT OR IGNORE INTO discovery_edges(from_video_id, to_video_id, edge_type, created_at)
+                VALUES (?, ?, 'related', ?)
                 """,
-                (
-                    video_id,
-                    title,
-                    candidate.get("channel"),
-                    candidate.get("channel_id"),
-                    duration_seconds,
-                    candidate.get("thumbnail_url"),
-                    published_at,
-                    view_count,
-                    year,
-                    view_sort,
-                    timestamp,
-                    timestamp,
-                ),
+                (discovered_from_video_id, video_id, timestamp),
             )
-            conn.execute(
-                """
-                INSERT INTO video_sources(source_id, video_id, first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(source_id, video_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-                """,
-                (source_id, video_id, timestamp, timestamp),
-            )
-            conn.execute(
-                """
-                INSERT INTO candidate_frontier(
-                    video_id, title, channel, channel_id, duration_seconds, thumbnail_url,
-                    published_at, view_count, state, priority, score, attempts, not_before,
-                    source_seed_id, discovered_from_video_id, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?)
-                ON CONFLICT(video_id) DO UPDATE SET
-                    title = COALESCE(excluded.title, candidate_frontier.title),
-                    channel = COALESCE(excluded.channel, candidate_frontier.channel),
-                    channel_id = COALESCE(excluded.channel_id, candidate_frontier.channel_id),
-                    duration_seconds = COALESCE(excluded.duration_seconds, candidate_frontier.duration_seconds),
-                    thumbnail_url = COALESCE(excluded.thumbnail_url, candidate_frontier.thumbnail_url),
-                    published_at = COALESCE(excluded.published_at, candidate_frontier.published_at),
-                    view_count = COALESCE(excluded.view_count, candidate_frontier.view_count),
-                    state = CASE
-                        WHEN candidate_frontier.state IN ('verified', 'rejected') THEN candidate_frontier.state
-                        ELSE 'queued'
-                    END,
-                    priority = MIN(candidate_frontier.priority, excluded.priority),
-                    score = MAX(candidate_frontier.score, excluded.score),
-                    not_before = MIN(candidate_frontier.not_before, excluded.not_before),
-                    source_seed_id = COALESCE(excluded.source_seed_id, candidate_frontier.source_seed_id),
-                    discovered_from_video_id = COALESCE(excluded.discovered_from_video_id, candidate_frontier.discovered_from_video_id),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    video_id,
-                    title,
-                    candidate.get("channel"),
-                    candidate.get("channel_id"),
-                    duration_seconds,
-                    candidate.get("thumbnail_url"),
-                    published_at,
-                    view_count,
-                    int(priority),
-                    float(score),
-                    timestamp,
-                    source_seed_id,
-                    discovered_from_video_id,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            if discovered_from_video_id:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO discovery_edges(from_video_id, to_video_id, edge_type, created_at)
-                    VALUES (?, ?, 'related', ?)
-                    """,
-                    (discovered_from_video_id, video_id, timestamp),
-                )
-            self._sync_video_search(conn, video_id)
-            self._sync_source_stats(conn, [source_id])
+        self._sync_video_search(conn, video_id)
+        return True
 
     def claim_frontier_candidates(self, *, limit: int = 10) -> list[dict[str, Any]]:
         timestamp = to_iso()
@@ -1169,48 +1239,80 @@ class Repository:
         return [dict(row) for row in rows]
 
     def mark_candidate_verified(self, video_id: str, *, source: str = "crawler") -> None:
+        self.mark_candidates_verified([video_id], source=source)
+
+    def mark_candidates_verified(self, video_ids: list[str], *, source: str = "crawler") -> None:
+        clean_ids = [str(video_id).strip() for video_id in video_ids if str(video_id).strip()]
+        if not clean_ids:
+            return
         timestamp = to_iso()
         with self.db.connect() as conn:
+            placeholders = ",".join("?" for _ in clean_ids)
             conn.execute(
-                """
+                f"""
                 UPDATE candidate_frontier
                 SET state = 'verified', last_checked_at = ?, updated_at = ?, last_error = NULL
-                WHERE video_id = ?
+                WHERE video_id IN ({placeholders})
                 """,
-                (timestamp, timestamp, video_id),
+                (timestamp, timestamp, *clean_ids),
             )
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO feed_state(video_id, promoted_at, source)
                 VALUES (?, ?, ?)
                 ON CONFLICT(video_id) DO UPDATE SET promoted_at = COALESCE(feed_state.promoted_at, excluded.promoted_at)
                 """,
-                (video_id, timestamp, source),
+                [(video_id, timestamp, source) for video_id in clean_ids],
             )
 
     def mark_candidate_rejected(self, video_id: str, reason: str) -> None:
+        self.mark_candidates_rejected([video_id], reason)
+
+    def mark_candidates_rejected(self, video_ids: list[str], reason: str) -> None:
+        clean_ids = [str(video_id).strip() for video_id in video_ids if str(video_id).strip()]
+        if not clean_ids:
+            return
         timestamp = to_iso()
         with self.db.connect() as conn:
+            placeholders = ",".join("?" for _ in clean_ids)
             conn.execute(
-                """
+                f"""
                 UPDATE candidate_frontier
                 SET state = 'rejected', last_error = ?, last_checked_at = ?, updated_at = ?
-                WHERE video_id = ?
+                WHERE video_id IN ({placeholders})
                 """,
-                (reason[:500], timestamp, timestamp, video_id),
+                (reason[:500], timestamp, timestamp, *clean_ids),
             )
 
     def mark_candidate_failed(self, video_id: str, error: str, *, delay_minutes: int = 60) -> None:
+        self.mark_candidates_failed([(video_id, error, delay_minutes)])
+
+    def mark_candidates_failed(self, failures: list[tuple[str, str, int]]) -> None:
+        clean_failures = [
+            (str(video_id).strip(), str(error), int(delay_minutes))
+            for video_id, error, delay_minutes in failures
+            if str(video_id).strip()
+        ]
+        if not clean_failures:
+            return
         timestamp = to_iso()
-        retry_at = to_iso(utc_now() + timedelta(minutes=max(1, int(delay_minutes))))
         with self.db.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 UPDATE candidate_frontier
                 SET state = 'failed', last_error = ?, last_checked_at = ?, not_before = ?, updated_at = ?
                 WHERE video_id = ?
                 """,
-                (error[:500], timestamp, retry_at, timestamp, video_id),
+                [
+                    (
+                        error[:500],
+                        timestamp,
+                        to_iso(utc_now() + timedelta(minutes=max(1, delay_minutes))),
+                        timestamp,
+                        video_id,
+                    )
+                    for video_id, error, delay_minutes in clean_failures
+                ],
             )
 
     def merge_starter_pack(self, starter_db_path: Path, *, version: str) -> dict[str, Any]:
@@ -2546,8 +2648,9 @@ class Repository:
                 for row in conn.execute(
                     """
                     SELECT DISTINCT t.language_code
-                    FROM video_audio_tracks t
-                    JOIN videos v ON v.video_id = t.video_id
+                    FROM videos v INDEXED BY idx_videos_catalog_visible_video
+                    JOIN video_audio_tracks t INDEXED BY idx_video_audio_tracks_video_original_language
+                      ON t.video_id = v.video_id
                     WHERE v.catalog_visible = 1
                       AND t.is_original_audio = 0
                     ORDER BY t.language_code

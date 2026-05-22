@@ -196,12 +196,17 @@ CREATE INDEX IF NOT EXISTS idx_videos_catalog_has_recent ON videos(has_dubbing, 
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_year_recent ON videos(published_year DESC, published_at DESC, video_id DESC) WHERE catalog_visible = 1;
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_channel_recent ON videos(channel COLLATE NOCASE, published_at DESC, video_id DESC) WHERE catalog_visible = 1;
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_random ON videos(random_key, video_id) WHERE catalog_visible = 1;
+CREATE INDEX IF NOT EXISTS idx_videos_catalog_visible_channel ON videos(catalog_visible, channel COLLATE NOCASE) WHERE channel IS NOT NULL AND channel != '';
+CREATE INDEX IF NOT EXISTS idx_videos_catalog_visible_year ON videos(catalog_visible, published_year DESC) WHERE published_year IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_videos_metadata_queue ON videos(metadata_complete, dub_classifier_version, metadata_sort_at, video_id) WHERE inspect_status = 'ok';
 CREATE INDEX IF NOT EXISTS idx_video_sources_source ON video_sources(source_id, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_video_sources_video ON video_sources(video_id, source_id);
 CREATE INDEX IF NOT EXISTS idx_video_audio_tracks_language_video ON video_audio_tracks(language_code, video_id);
 CREATE INDEX IF NOT EXISTS idx_video_audio_tracks_base_video ON video_audio_tracks(language_base, video_id);
 CREATE INDEX IF NOT EXISTS idx_video_audio_tracks_base_original_video ON video_audio_tracks(language_base, is_original_audio, video_id);
+CREATE INDEX IF NOT EXISTS idx_video_audio_tracks_original_language ON video_audio_tracks(is_original_audio, language_code, video_id);
+CREATE INDEX IF NOT EXISTS idx_video_audio_tracks_video_original_language ON video_audio_tracks(video_id, is_original_audio, language_code);
+CREATE INDEX IF NOT EXISTS idx_videos_catalog_visible_video ON videos(catalog_visible, video_id);
 CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_claim ON scheduler_jobs(state, not_before, priority, id);
 CREATE INDEX IF NOT EXISTS idx_scheduler_jobs_lease ON scheduler_jobs(state, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_discovery_seeds_next ON discovery_seeds(enabled, next_discovery_at, priority, id);
@@ -402,6 +407,29 @@ class Database:
             FROM sources
             """
         )
+        source_stats_pref = conn.execute(
+            "SELECT value FROM app_preferences WHERE key = 'source_stats_v1'"
+        ).fetchone()
+        if source_stats_pref is None:
+            conn.execute("DELETE FROM source_stats")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO source_stats(source_id, video_count)
+                SELECT source_id, COUNT(*)
+                FROM video_sources
+                GROUP BY source_id
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO source_stats(source_id, video_count)
+                SELECT id, 0
+                FROM sources
+                """
+            )
+            conn.execute(
+                "INSERT INTO app_preferences(key, value) VALUES('source_stats_v1', '1')"
+            )
         if added_derived_columns or conn.execute("SELECT COUNT(*) FROM video_search").fetchone()[0] == 0:
             conn.execute(
                 """
