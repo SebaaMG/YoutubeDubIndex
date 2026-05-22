@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,8 +75,47 @@ class SourceUiTests(unittest.TestCase):
         self.repo = repo
 
     def tearDown(self) -> None:
+        self.wait_for_window_threads_idle()
         self.window.close()
         self.temp_dir.cleanup()
+
+    def wait_for_window_threads_idle(self, timeout: float = 3.0) -> None:
+        deadline = time.time() + timeout
+        thread_attrs = [
+            "_catalog_filter_threads",
+            "_catalog_page_threads",
+            "_summary_refresh_threads",
+            "_manual_discovery_threads",
+            "_interest_discovery_threads",
+            "_metadata_backfill_threads",
+            "_update_threads",
+            "_catalog_count_threads",
+            "_active_run_snapshot_threads",
+            "_ui_action_threads",
+        ]
+        while time.time() < deadline:
+            self.app.processEvents()
+            pending_handlers = bool(getattr(self.window, "_ui_action_handlers", {}))
+            alive = [
+                thread
+                for attr in thread_attrs
+                for thread in getattr(self.window, attr, [])
+                if thread.is_alive()
+            ]
+            if not alive and not pending_handlers:
+                return
+            time.sleep(0.01)
+
+    def wait_for_ui_actions_idle(self, timeout: float = 3.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.app.processEvents()
+            action_threads = getattr(self.window, "_ui_action_threads", [])
+            if not any(thread.is_alive() for thread in action_threads) and not getattr(self.window, "_ui_action_handlers", {}):
+                self.app.processEvents()
+                return
+            time.sleep(0.01)
+        raise AssertionError("UI action did not become idle")
 
     def test_selecting_row_does_not_auto_enter_edit_mode(self) -> None:
         self.controller.create_source(
@@ -109,6 +149,7 @@ class SourceUiTests(unittest.TestCase):
         self.window.source_value.setText("kurzgesagt space")
         self.window.source_max_candidates.setValue(25)
         self.window.save_source()
+        self.wait_for_ui_actions_idle()
 
         sources = self.controller.list_sources()
         self.assertEqual(len(sources), 2)
@@ -167,6 +208,7 @@ class SourceUiTests(unittest.TestCase):
     def test_quick_source_creation_uses_empty_catalog_field_and_creates_interest(self) -> None:
         self.window.catalog_empty_input.setText("@kurzgesagt")
         self.window.handle_catalog_quick_submit()
+        self.wait_for_ui_actions_idle()
 
         seeds = self.controller.list_discovery_seeds()
         self.assertEqual(len(seeds), 1)
@@ -223,6 +265,7 @@ class SourceUiTests(unittest.TestCase):
         self.assertFalse(self.window.source_increase_limit_button.isHidden())
 
         self.window.increase_full_source_limits()
+        self.wait_for_ui_actions_idle()
 
         sources_by_id = {int(source["id"]): source for source in self.controller.list_sources()}
         self.assertEqual(sources_by_id[full_a]["max_candidates_per_run"], 502)
@@ -321,17 +364,40 @@ class SourceUiTests(unittest.TestCase):
         self.window.source_value.setText("anime latino")
         self.window.source_max_candidates.setValue(3456)
         self.window.save_source()
+        self.wait_for_ui_actions_idle()
 
         self.assertEqual(self.controller.get_last_max_candidates(), 3456)
         self.assertEqual(self.window.source_max_candidates.value(), 3456)
         self.assertEqual(len(self.runner.calls), 1)
         self.assertEqual(self.runner.calls[0]["kwargs"]["scope"], "source:1")
 
+    def test_save_source_runs_controller_work_off_ui_thread(self) -> None:
+        original_create_source = self.controller.create_source
+
+        def slow_create_source(*args: object, **kwargs: object) -> int:
+            time.sleep(0.15)
+            return original_create_source(*args, **kwargs)
+
+        self.controller.create_source = slow_create_source  # type: ignore[method-assign]
+        self.window.source_type.setCurrentIndex(self.window.source_type.findData("search"))
+        self.window.source_value.setText("slow source")
+
+        started = time.perf_counter()
+        self.window.save_source()
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.08)
+        self.assertFalse(self.window.source_save_button.isEnabled())
+        self.wait_for_ui_actions_idle()
+        self.assertTrue(self.window.source_save_button.isEnabled())
+        self.assertEqual(len(self.controller.list_sources()), 1)
+
     def test_enter_in_source_value_saves_source(self) -> None:
         self.window.source_type.setCurrentIndex(self.window.source_type.findData("search"))
         self.window.source_value.setText("MrBeast")
 
         self.window.source_value.returnPressed.emit()
+        self.wait_for_ui_actions_idle()
 
         sources = self.controller.list_sources()
         self.assertEqual(len(sources), 1)
@@ -352,6 +418,7 @@ class SourceUiTests(unittest.TestCase):
         self.window.source_enabled.setChecked(False)
 
         self.window.save_source()
+        self.wait_for_ui_actions_idle()
 
         self.assertEqual(len(self.controller.list_sources()), 1)
         self.assertEqual(len(self.runner.calls), 0)
@@ -399,6 +466,7 @@ class SourceUiTests(unittest.TestCase):
 
         with patch.object(self.window, "confirm_delete_sources", return_value=False):
             self.window.delete_selected_sources()
+            self.wait_for_ui_actions_idle()
 
         self.assertEqual(self.controller.list_sources(), [])
         catalog = self.controller.list_catalog(
@@ -494,6 +562,7 @@ class SourceUiTests(unittest.TestCase):
 
         with patch.object(self.window, "confirm_delete_sources", return_value=True):
             self.window.delete_selected_sources()
+            self.wait_for_ui_actions_idle()
 
         self.assertEqual(self.controller.list_sources(), [])
         catalog = self.controller.list_catalog(

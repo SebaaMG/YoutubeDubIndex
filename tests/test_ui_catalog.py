@@ -9,7 +9,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QObject, QSize, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QNetworkReply
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -68,6 +69,46 @@ def wait_for_summary_idle(window: MainWindow, app: QApplication, timeout: float 
             return
         time.sleep(0.01)
     raise AssertionError("summary refresh did not become idle")
+
+
+def wait_for_ui_actions_idle(window: MainWindow, app: QApplication, timeout: float = 3.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        app.processEvents()
+        action_threads = getattr(window, "_ui_action_threads", [])
+        if not any(thread.is_alive() for thread in action_threads) and not getattr(window, "_ui_action_handlers", {}):
+            app.processEvents()
+            return
+        time.sleep(0.01)
+    raise AssertionError("UI action did not become idle")
+
+
+def wait_for_window_threads_idle(window: MainWindow, app: QApplication, timeout: float = 3.0) -> None:
+    deadline = time.time() + timeout
+    thread_attrs = [
+        "_catalog_filter_threads",
+        "_catalog_page_threads",
+        "_summary_refresh_threads",
+        "_manual_discovery_threads",
+        "_interest_discovery_threads",
+        "_metadata_backfill_threads",
+        "_update_threads",
+        "_catalog_count_threads",
+        "_active_run_snapshot_threads",
+        "_ui_action_threads",
+    ]
+    while time.time() < deadline:
+        app.processEvents()
+        pending_handlers = bool(getattr(window, "_ui_action_handlers", {}))
+        alive = [
+            thread
+            for attr in thread_attrs
+            for thread in getattr(window, attr, [])
+            if thread.is_alive()
+        ]
+        if not alive and not pending_handlers:
+            return
+        time.sleep(0.01)
 
 
 class FakeRunner:
@@ -180,6 +221,7 @@ class CatalogUiTests(unittest.TestCase):
         self.window = MainWindow(self.controller, services)
 
     def tearDown(self) -> None:
+        wait_for_window_threads_idle(self.window, self.app)
         self.window.close()
         self.temp_dir.cleanup()
 
@@ -359,6 +401,76 @@ class CatalogUiTests(unittest.TestCase):
 
     def test_thumbnail_render_scale_keeps_cards_clearer_than_half_resolution(self) -> None:
         self.assertEqual(THUMBNAIL_RENDER_SCALE, 0.75)
+
+    def test_thumbnail_service_caps_active_network_requests(self) -> None:
+        class FakeReply(QObject):
+            finished = Signal()
+
+        class FakeManager:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+                self.replies: list[FakeReply] = []
+
+            def get(self, request: object) -> FakeReply:
+                url_getter = getattr(request, "url")
+                self.urls.append(url_getter().toString())
+                reply = FakeReply()
+                self.replies.append(reply)
+                return reply
+
+        owner = QWidget()
+        service = ThumbnailService(owner, Path(self.temp_dir.name) / "thumbs")
+        fake_manager = FakeManager()
+        service.manager = fake_manager  # type: ignore[assignment]
+
+        for index in range(20):
+            service.request(
+                f"https://example.test/thumb-{index}.jpg",
+                QSize(96, 54),
+                lambda _pixmap: None,
+            )
+
+        self.assertEqual(len(fake_manager.urls), 6)
+        self.assertLessEqual(getattr(service, "active_request_count")(), 6)
+        service.shutdown()
+
+    def test_model_batches_thumbnail_updates_into_contiguous_ranges(self) -> None:
+        model = ui_module.CatalogListModel()
+        model.set_items(
+            [
+                {"video_id": "a", "thumbnail_url": "one"},
+                {"video_id": "b", "thumbnail_url": "one"},
+                {"video_id": "c", "thumbnail_url": "skip"},
+                {"video_id": "d", "thumbnail_url": "two"},
+            ]
+        )
+        emissions: list[tuple[int, int]] = []
+        model.dataChanged.connect(lambda top, bottom, _roles: emissions.append((top.row(), bottom.row())))
+        pixmap = QPixmap(4, 4)
+        pixmap.fill()
+
+        model.set_thumbnails_batch({"one": pixmap, "two": pixmap})
+
+        self.assertEqual(emissions, [(0, 1), (3, 3)])
+
+    def test_stale_catalog_thumbnails_do_not_emit_model_changes(self) -> None:
+        self.window.catalog_model.set_items(
+            [
+                {"video_id": "visible", "thumbnail_url": "visible-url"},
+                {"video_id": "stale", "thumbnail_url": "stale-url"},
+            ]
+        )
+        emissions: list[tuple[int, int]] = []
+        self.window.catalog_model.dataChanged.connect(
+            lambda top, bottom, _roles: emissions.append((top.row(), bottom.row()))
+        )
+        self.window._catalog_visible_thumbnail_urls = {"visible-url"}
+        pixmap = QPixmap(4, 4)
+        pixmap.fill()
+
+        self.window.apply_catalog_thumbnail("stale-url", pixmap, self.window._catalog_query_generation)
+
+        self.assertEqual(emissions, [])
 
     def test_catalog_header_and_filter_bar_are_compact(self) -> None:
         self.window.resize(1600, 1000)
@@ -644,6 +756,7 @@ class CatalogUiTests(unittest.TestCase):
         item = next(item for item in self.window._catalog_rows if item["video_id"] == "abc123")
         self.assertFalse(bool(item.get("is_favorite")))
         self.window.toggle_catalog_favorite(item, True)
+        wait_for_ui_actions_idle(self.window, self.app)
         self.app.processEvents()
 
         favorites = self.repo.list_catalog(
@@ -718,6 +831,32 @@ class CatalogUiTests(unittest.TestCase):
         self.assertIsNone(self.window.catalog_before_year.currentData())
         self.assertFalse(self.window.catalog_favorites_only.isChecked())
 
+    def test_favorite_toggle_is_optimistic_and_rolls_back_on_error(self) -> None:
+        self.window.switch_page("catalog")
+        self.window.show()
+        self.app.processEvents()
+        self.window.refresh_catalog()
+        wait_for_catalog_idle(self.window, self.app)
+        item = next(item for item in self.window._catalog_rows if item["video_id"] == "abc123")
+        errors: list[tuple[str, str]] = []
+
+        def failing_set_favorite(_video_id: str, _is_favorite: bool) -> None:
+            raise RuntimeError("database busy")
+
+        self.controller.set_video_favorite = failing_set_favorite  # type: ignore[method-assign]
+        self.window.show_error = lambda title, error: errors.append((title, str(error)))  # type: ignore[method-assign]
+
+        started = time.perf_counter()
+        self.window.toggle_catalog_favorite(item, True)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.05)
+        self.assertTrue(bool(item.get("is_favorite")))
+        wait_for_ui_actions_idle(self.window, self.app)
+
+        self.assertFalse(bool(item.get("is_favorite")))
+        self.assertEqual(errors, [("No se pudo actualizar el favorito", "database busy")])
+
 
 class EmptyCatalogUiTests(unittest.TestCase):
     @classmethod
@@ -745,6 +884,7 @@ class EmptyCatalogUiTests(unittest.TestCase):
         self.window = MainWindow(self.controller, services)
 
     def tearDown(self) -> None:
+        wait_for_window_threads_idle(self.window, self.app)
         self.window.close()
         self.temp_dir.cleanup()
 
