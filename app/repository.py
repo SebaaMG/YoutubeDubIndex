@@ -754,16 +754,21 @@ class Repository:
         replace_existing_system_search = bool(
             isinstance(payload, dict) and payload.get("replace_existing_system_search")
         )
-        packaged_values: list[str] = []
+        packaged_search_values: list[str] = []
+        packaged_channel_values: list[str] = []
         imported = 0
         for entry in entries:
             priority = 50
             label: str | None
             value: str | None
+            source_type = "search"
             if isinstance(entry, dict):
                 raw_value = entry.get("query") or entry.get("value") or entry.get("term")
                 value = str(raw_value or "").strip()
                 label = str(entry.get("label") or value).strip()
+                raw_source_type = str(entry.get("source_type") or entry.get("type") or "search").strip().lower()
+                if raw_source_type in {"channel", "youtube_channel"}:
+                    source_type = "channel"
                 try:
                     priority = int(entry.get("priority") or priority)
                 except (TypeError, ValueError):
@@ -773,10 +778,13 @@ class Repository:
                 label = value
             if not value:
                 continue
-            packaged_values.append(value)
+            if source_type == "channel":
+                packaged_channel_values.append(value)
+            else:
+                packaged_search_values.append(value)
             self.create_discovery_seed(
-                seed_kind="system_search",
-                source_type="search",
+                seed_kind="system_channel" if source_type == "channel" else "system_search",
+                source_type=source_type,
                 label=label or value,
                 value=value,
                 priority=priority,
@@ -784,8 +792,8 @@ class Repository:
             imported += 1
 
         disabled_existing = 0
-        if replace_existing_system_search and packaged_values:
-            placeholders = ",".join("?" for _ in packaged_values)
+        if replace_existing_system_search and packaged_search_values:
+            placeholders = ",".join("?" for _ in packaged_search_values)
             timestamp = to_iso()
             with self.db.connect() as conn:
                 cursor = conn.execute(
@@ -796,9 +804,24 @@ class Repository:
                       AND source_type = 'search'
                       AND value NOT IN ({placeholders})
                     """,
-                    (timestamp, *packaged_values),
+                    (timestamp, *packaged_search_values),
                 )
                 disabled_existing = int(cursor.rowcount)
+        if replace_existing_system_search and packaged_channel_values:
+            placeholders = ",".join("?" for _ in packaged_channel_values)
+            timestamp = to_iso()
+            with self.db.connect() as conn:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE discovery_seeds
+                    SET enabled = 0, updated_at = ?
+                    WHERE seed_kind = 'system_channel'
+                      AND source_type = 'channel'
+                      AND value NOT IN ({placeholders})
+                    """,
+                    (timestamp, *packaged_channel_values),
+                )
+                disabled_existing += int(cursor.rowcount)
 
         self.set_preference(preference_key, "1")
         return {"skipped": False, "imported": imported, "disabled_existing": disabled_existing}
@@ -1845,7 +1868,11 @@ class Repository:
         source_id: int | None = None,
         limit: int = 50,
         classifier_version: int = CURRENT_DUB_CLASSIFIER_VERSION,
+        recent_recheck_days: int = 21,
+        recent_recheck_hours: int = 12,
     ) -> list[str]:
+        recent_cutoff_day = (utc_now() - timedelta(days=max(1, int(recent_recheck_days)))).date().isoformat()
+        recent_checked_before = to_iso(utc_now() - timedelta(hours=max(1, int(recent_recheck_hours))))
         clauses = [
             "v.inspect_status = 'ok'",
             "("
@@ -1857,9 +1884,14 @@ class Repository:
             "SELECT 1 FROM video_audio_tracks t "
             "WHERE t.video_id = v.video_id AND t.language_base = 'es' AND t.is_original_audio IS NULL"
             ")"
+            "OR (v.metadata_complete = 1 "
+            "AND v.published_at IS NOT NULL AND v.published_at != '' "
+            "AND SUBSTR(v.published_at, 1, 10) >= ? "
+            "AND (v.last_checked_at IS NULL OR v.last_checked_at <= ?)"
+            ")"
             ")",
         ]
-        params: list[Any] = [int(classifier_version)]
+        params: list[Any] = [int(classifier_version), recent_cutoff_day, recent_checked_before]
         if source_id is not None:
             clauses.append(
                 "EXISTS (SELECT 1 FROM video_sources vs WHERE vs.video_id = v.video_id AND vs.source_id = ?)"
@@ -1877,11 +1909,16 @@ class Repository:
                         SELECT 1 FROM video_audio_tracks t
                         WHERE t.video_id = v.video_id AND t.language_base = 'es' AND t.is_original_audio IS NULL
                     ) THEN 1
+                    WHEN v.metadata_complete = 1
+                     AND v.published_at IS NOT NULL AND v.published_at != ''
+                     AND SUBSTR(v.published_at, 1, 10) >= ?
+                     AND (v.last_checked_at IS NULL OR v.last_checked_at <= ?) THEN 2
                     ELSE 2
                 END,
                 COALESCE(v.metadata_sort_at, v.last_checked_at, v.last_seen_at) ASC
             LIMIT ?
         """
+        params[-1:-1] = [recent_cutoff_day, recent_checked_before]
         with self.db.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [str(row["video_id"]) for row in rows]
@@ -1890,7 +1927,11 @@ class Repository:
         self,
         *,
         classifier_version: int = CURRENT_DUB_CLASSIFIER_VERSION,
+        recent_recheck_days: int = 21,
+        recent_recheck_hours: int = 12,
     ) -> int:
+        recent_cutoff_day = (utc_now() - timedelta(days=max(1, int(recent_recheck_days)))).date().isoformat()
+        recent_checked_before = to_iso(utc_now() - timedelta(hours=max(1, int(recent_recheck_hours))))
         with self.db.connect(profile="ui_read") as conn:
             return int(
                 conn.execute(
@@ -1909,9 +1950,15 @@ class Repository:
                                 AND t.language_base = 'es'
                                 AND t.is_original_audio IS NULL
                           )
+                          OR (
+                              metadata_complete = 1
+                              AND published_at IS NOT NULL AND published_at != ''
+                              AND SUBSTR(published_at, 1, 10) >= ?
+                              AND (last_checked_at IS NULL OR last_checked_at <= ?)
+                          )
                       )
                     """,
-                    (int(classifier_version),),
+                    (int(classifier_version), recent_cutoff_day, recent_checked_before),
                 ).fetchone()[0]
             )
 

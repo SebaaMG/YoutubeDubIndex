@@ -19,6 +19,8 @@ class Settings:
     inspect_retry_attempts: int = 2
     inspect_stale_days: int = 30
     dub_classifier_version: int = 9
+    recent_dub_recheck_days: int = 21
+    recent_dub_recheck_hours: int = 12
     metadata_backfill_limit: int = 1000
     startup_metadata_backfill_limit: int = 250
     metadata_backfill_workers: int = 2
@@ -30,7 +32,7 @@ class Settings:
     discovery_seed_candidate_limit: int = 50
     discovery_loop_interval_seconds: int = 300
     starter_pack_version: str = "v3"
-    content_pool_version: str = "v2"
+    content_pool_version: str = "v3"
     update_manifest_url: str = ""
 
     @property
@@ -79,7 +81,7 @@ class Settings:
 
     @property
     def content_pool_path(self) -> Path:
-        return self.resource_root / "resources" / "discovery" / "content_pool_v2.json"
+        return self.resource_root / "resources" / "discovery" / f"content_pool_{self.content_pool_version}.json"
 
 
 def get_settings() -> Settings:

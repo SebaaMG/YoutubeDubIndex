@@ -69,6 +69,13 @@ class RunManager:
     def dub_classifier_version(self) -> int:
         return int(getattr(self.settings, "dub_classifier_version", 7))
 
+    def _metadata_refresh_options(self) -> dict[str, int]:
+        return {
+            "classifier_version": self.dub_classifier_version,
+            "recent_recheck_days": int(getattr(self.settings, "recent_dub_recheck_days", 21)),
+            "recent_recheck_hours": int(getattr(self.settings, "recent_dub_recheck_hours", 12)),
+        }
+
     def _run_wrapper(self, run_id: int, source_id: int | None) -> None:
         try:
             self.repo.mark_run_running(run_id)
@@ -132,7 +139,7 @@ class RunManager:
         for missing_video_id in self.repo.list_video_ids_missing_metadata(
             source_id=source_id,
             limit=backfill_limit,
-            classifier_version=self.dub_classifier_version,
+            **self._metadata_refresh_options(),
         ):
             videos_to_inspect.add(missing_video_id)
 
@@ -152,7 +159,7 @@ class RunManager:
         backfill_limit = int(limit or getattr(self.settings, "metadata_backfill_limit", 50))
         video_ids = self.repo.list_video_ids_missing_metadata(
             limit=backfill_limit,
-            classifier_version=self.dub_classifier_version,
+            **self._metadata_refresh_options(),
         )
         if not video_ids:
             return None

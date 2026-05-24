@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from app.db import Database
@@ -14,6 +15,7 @@ from app.repository import (
     Repository,
     SourceInput,
     to_iso,
+    utc_now,
 )
 
 
@@ -1318,6 +1320,35 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual({seed["seed_kind"] for seed in seeds}, {"system_search"})
         self.assertEqual({seed["source_type"] for seed in seeds}, {"search"})
 
+    def test_import_content_pool_can_create_system_channel_seeds(self) -> None:
+        pool_path = Path(self.temp_dir.name) / "content_pool_channels.json"
+        pool_path.write_text(
+            json.dumps(
+                {
+                    "version": "test-v3",
+                    "theme_queries": [
+                        {"query": "the problem with YouTube", "priority": 50},
+                        {
+                            "type": "channel",
+                            "label": "Evan Carmichael",
+                            "value": "UCKmkpoEqg1sOMGEiIysP8Tw",
+                            "priority": 35,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.repo.import_content_pool(pool_path, version="test-v3")
+
+        seeds = {seed["value"]: seed for seed in self.repo.list_discovery_seeds()}
+        self.assertEqual(result["imported"], 2)
+        self.assertEqual(seeds["the problem with YouTube"]["seed_kind"], "system_search")
+        self.assertEqual(seeds["the problem with YouTube"]["source_type"], "search")
+        self.assertEqual(seeds["UCKmkpoEqg1sOMGEiIysP8Tw"]["seed_kind"], "system_channel")
+        self.assertEqual(seeds["UCKmkpoEqg1sOMGEiIysP8Tw"]["source_type"], "channel")
+
     def test_import_content_pool_can_replace_packaged_system_search_seeds(self) -> None:
         self.repo.create_discovery_seed(
             seed_kind="system_search",
@@ -1355,6 +1386,44 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(seeds["mrbeast"]["enabled"], 1)
         self.assertEqual(seeds["the problem with YouTube"]["enabled"], 1)
         self.assertEqual(seeds["influencer got exposed"]["enabled"], 1)
+
+    def test_recent_complete_videos_are_rechecked_for_late_manual_dubs(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        recent_day = utc_now().date().isoformat()
+        old_check = to_iso(utc_now() - timedelta(hours=13))
+        fresh_check = to_iso(utc_now() - timedelta(hours=1))
+
+        for video_id, checked_at in (("recent_recheck", old_check), ("fresh_recheck", fresh_check)):
+            self.repo.upsert_candidate(
+                CandidateVideo(video_id, f"Title {video_id}", "Chan", "chan1", 100, None, source_id, to_iso())
+            )
+            self.repo.store_inspection_result(
+                video_id,
+                audio_languages=["en-US", "es-US"],
+                has_dubbing=True,
+                dub_kind="automatic",
+                dub_evidence={
+                    "source": "inspection",
+                    "auto_dubbed_languages": ["es-US"],
+                    "original_audio_languages": ["en-US"],
+                },
+                published_at=recent_day,
+                view_count=100,
+            )
+            with self.repo.db.connect() as conn:
+                conn.execute(
+                    "UPDATE videos SET last_checked_at = ?, metadata_sort_at = ? WHERE video_id = ?",
+                    (checked_at, checked_at, video_id),
+                )
+
+        missing = self.repo.list_video_ids_missing_metadata(
+            limit=10,
+            recent_recheck_days=21,
+            recent_recheck_hours=12,
+        )
+
+        self.assertIn("recent_recheck", missing)
+        self.assertNotIn("fresh_recheck", missing)
 
     def test_mixed_discovery_seed_claim_uses_seven_content_and_three_free_slots(self) -> None:
         for index in range(8):

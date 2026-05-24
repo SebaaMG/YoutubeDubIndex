@@ -389,7 +389,9 @@ class AppController:
 
     def count_videos_missing_metadata(self) -> int:
         return self.services.repo.count_videos_missing_metadata(
-            classifier_version=self.services.settings.dub_classifier_version
+            classifier_version=self.services.settings.dub_classifier_version,
+            recent_recheck_days=int(getattr(self.services.settings, "recent_dub_recheck_days", 21)),
+            recent_recheck_hours=int(getattr(self.services.settings, "recent_dub_recheck_hours", 12)),
         )
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
