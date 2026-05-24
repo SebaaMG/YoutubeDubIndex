@@ -8,10 +8,10 @@ Target app: local Windows desktop app for discovering YouTube videos with confir
 
 Implemented in `main` after the last two pushes:
 
-- `resources/discovery/content_pool_v2.json` ships broad English content-search seeds grouped by balanced reaction lanes for reaction-friendly discovery.
+- `resources/discovery/content_pool_v4.json` ships broad English content-search seeds grouped by balanced reaction lanes for reaction-friendly discovery.
 - Startup imports that file idempotently as `system_search` seeds using `content_pool_version`.
 - The discovery worker now claims seeds with a deterministic 10-slot pattern: 7 content slots and 3 free YouTube graph slots.
-- Content slots include `system_search`, `system_channel`, `user_search`, and `user_channel`.
+- Content slots include packaged `system_search` plus `user_search` and `user_channel`. Packaged system channels are intentionally not part of the default pool.
 - Free slots include `starter_video` and `related_video`.
 - User-entered search/channel interests are saved permanently and immediately enqueue 150 candidates in a background thread.
 - The catalog button now reads `Explorar 200` and inspects up to 200 queued candidates per click.
@@ -53,11 +53,11 @@ The app should demote low-signal clusters, not reject broad topics.
 
 ## Implemented Data
 
-The shipped resource is `resources/discovery/content_pool_v2.json`. It intentionally contains a flat `theme_queries` list with balanced `family` metadata for audit only; every query still imports as a normal `system_search` seed:
+The shipped resource is `resources/discovery/content_pool_v4.json`. It intentionally contains a flat `theme_queries` list with balanced `family` metadata for audit only; every query still imports as a normal `system_search` seed:
 
 ```json
 {
-  "version": "v2",
+  "version": "v4",
   "replace_existing_system_search": true,
   "theme_queries": [
     {"family": "platform_creator_internet", "query": "the problem with YouTube"},
@@ -95,14 +95,14 @@ The score should not reject anything. It should only change inspection order.
 
 ## Implementation Order
 
-1. Import static profile seeds into existing `discovery_seeds`. Done for `content_pool_v2.json`.
+1. Import static profile seeds into existing `discovery_seeds`. Done for `content_pool_v4.json`.
    - theme queries become `system_search` seeds.
    - Gate import by an `app_preferences` version key so it is idempotent.
 
 2. Claim seeds through the 70/30 mix. Done.
    - 7 content slots, 3 free slots.
    - Fallback to whichever pool has eligible seeds.
-   - User search/channel seeds belong to the content pool.
+   - User search/channel seeds belong to the content pool, but packaged system channels do not.
 
 3. Add optional candidate scoring only after the pool-based approach is measured.
    - Keep existing channel diversity ordering and same-channel seed dampening.

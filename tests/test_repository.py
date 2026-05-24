@@ -1320,7 +1320,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual({seed["seed_kind"] for seed in seeds}, {"system_search"})
         self.assertEqual({seed["source_type"] for seed in seeds}, {"search"})
 
-    def test_import_content_pool_can_create_system_channel_seeds(self) -> None:
+    def test_import_content_pool_ignores_system_channel_entries_by_default(self) -> None:
         pool_path = Path(self.temp_dir.name) / "content_pool_channels.json"
         pool_path.write_text(
             json.dumps(
@@ -1343,11 +1343,10 @@ class RepositoryTests(unittest.TestCase):
         result = self.repo.import_content_pool(pool_path, version="test-v3")
 
         seeds = {seed["value"]: seed for seed in self.repo.list_discovery_seeds()}
-        self.assertEqual(result["imported"], 2)
+        self.assertEqual(result["imported"], 1)
         self.assertEqual(seeds["the problem with YouTube"]["seed_kind"], "system_search")
         self.assertEqual(seeds["the problem with YouTube"]["source_type"], "search")
-        self.assertEqual(seeds["UCKmkpoEqg1sOMGEiIysP8Tw"]["seed_kind"], "system_channel")
-        self.assertEqual(seeds["UCKmkpoEqg1sOMGEiIysP8Tw"]["source_type"], "channel")
+        self.assertNotIn("UCKmkpoEqg1sOMGEiIysP8Tw", seeds)
 
     def test_import_content_pool_can_replace_packaged_system_search_seeds(self) -> None:
         self.repo.create_discovery_seed(
@@ -1386,6 +1385,33 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(seeds["mrbeast"]["enabled"], 1)
         self.assertEqual(seeds["the problem with YouTube"]["enabled"], 1)
         self.assertEqual(seeds["influencer got exposed"]["enabled"], 1)
+
+    def test_import_content_pool_can_disable_existing_system_channel_seeds(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="system_channel",
+            source_type="channel",
+            label="Old channel seed",
+            value="UCKmkpoEqg1sOMGEiIysP8Tw",
+            priority=35,
+        )
+        pool_path = Path(self.temp_dir.name) / "content_pool_v4.json"
+        pool_path.write_text(
+            json.dumps(
+                {
+                    "version": "test-v4",
+                    "replace_existing_system_search": True,
+                    "disable_system_channels": True,
+                    "theme_queries": [{"query": "internet mysteries explained", "priority": 50}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.repo.import_content_pool(pool_path, version="test-v4")
+
+        seeds = {seed["value"]: seed for seed in self.repo.list_discovery_seeds()}
+        self.assertEqual(seeds["UCKmkpoEqg1sOMGEiIysP8Tw"]["enabled"], 0)
+        self.assertEqual(seeds["internet mysteries explained"]["enabled"], 1)
 
     def test_recent_complete_videos_are_rechecked_for_late_manual_dubs(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
@@ -1479,6 +1505,28 @@ class RepositoryTests(unittest.TestCase):
         claimed_kinds = {seed["seed_kind"] for seed in claimed}
         self.assertIn("user_search", claimed_kinds)
         self.assertIn("user_channel", claimed_kinds)
+
+    def test_mixed_discovery_seed_claim_does_not_spend_content_slots_on_system_channels(self) -> None:
+        self.repo.create_discovery_seed(
+            seed_kind="system_channel",
+            source_type="channel",
+            label="Packaged channel",
+            value="UCKmkpoEqg1sOMGEiIysP8Tw",
+            priority=35,
+        )
+        for index in range(4):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Free {index}",
+                value=f"free-no-system-channel-{index}",
+                priority=80,
+            )
+
+        claimed = self.repo.claim_discovery_seeds_mixed(limit=3, randomize=False)
+
+        self.assertEqual(len(claimed), 3)
+        self.assertEqual({seed["seed_kind"] for seed in claimed}, {"related_video"})
 
     def test_mixed_discovery_seed_claim_falls_back_to_available_pool(self) -> None:
         for index in range(4):

@@ -18,7 +18,7 @@ INTERNAL_DISCOVERY_SOURCE_VALUE = "__auto_discovery__"
 CATALOG_SEARCH_PROBE_LIMIT = 5_000
 CATALOG_SEARCH_DENSE_MATCH_RATIO = 0.005
 YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-CONTENT_DISCOVERY_SEED_KINDS = ("system_search", "system_channel", "user_search", "user_channel")
+CONTENT_DISCOVERY_SEED_KINDS = ("system_search", "user_search", "user_channel")
 FREE_DISCOVERY_SEED_KINDS = ("starter_video", "related_video")
 DISCOVERY_POOL_PATTERN = ("content",) * 7 + ("free",) * 3
 DISCOVERY_POOL_CURSOR_KEY = "discovery_pool_slot_index:v1"
@@ -754,6 +754,8 @@ class Repository:
         replace_existing_system_search = bool(
             isinstance(payload, dict) and payload.get("replace_existing_system_search")
         )
+        allow_system_channels = bool(isinstance(payload, dict) and payload.get("allow_system_channels"))
+        disable_system_channels = bool(isinstance(payload, dict) and payload.get("disable_system_channels"))
         packaged_search_values: list[str] = []
         packaged_channel_values: list[str] = []
         imported = 0
@@ -777,6 +779,8 @@ class Repository:
                 value = str(entry or "").strip()
                 label = value
             if not value:
+                continue
+            if source_type == "channel" and not allow_system_channels:
                 continue
             if source_type == "channel":
                 packaged_channel_values.append(value)
@@ -807,7 +811,20 @@ class Repository:
                     (timestamp, *packaged_search_values),
                 )
                 disabled_existing = int(cursor.rowcount)
-        if replace_existing_system_search and packaged_channel_values:
+        if disable_system_channels:
+            timestamp = to_iso()
+            with self.db.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE discovery_seeds
+                    SET enabled = 0, updated_at = ?
+                    WHERE seed_kind = 'system_channel'
+                      AND source_type = 'channel'
+                    """,
+                    (timestamp,),
+                )
+                disabled_existing += int(cursor.rowcount)
+        elif replace_existing_system_search and packaged_channel_values:
             placeholders = ",".join("?" for _ in packaged_channel_values)
             timestamp = to_iso()
             with self.db.connect() as conn:

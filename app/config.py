@@ -32,7 +32,7 @@ class Settings:
     discovery_seed_candidate_limit: int = 50
     discovery_loop_interval_seconds: int = 300
     starter_pack_version: str = "v3"
-    content_pool_version: str = "v3"
+    content_pool_version: str = "v4"
     update_manifest_url: str = ""
 
     @property
