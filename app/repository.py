@@ -427,7 +427,7 @@ class Repository:
                     )
 
     def dashboard_stats(self) -> dict[str, Any]:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             active_sources = conn.execute(
                 "SELECT COUNT(*) FROM sources WHERE enabled = 1 AND value != ?",
                 (INTERNAL_DISCOVERY_SOURCE_VALUE,),
@@ -455,7 +455,7 @@ class Repository:
         }
 
     def list_sources(self) -> list[dict[str, Any]]:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             rows = conn.execute(
                 """
                 SELECT
@@ -476,7 +476,7 @@ class Repository:
         return [dict(row) for row in rows]
 
     def get_source(self, source_id: int) -> dict[str, Any] | None:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             row = conn.execute(
                 "SELECT * FROM sources WHERE id = ?", (source_id,)
             ).fetchone()
@@ -804,7 +804,7 @@ class Repository:
         return {"skipped": False, "imported": imported, "disabled_existing": disabled_existing}
 
     def list_discovery_seeds(self) -> list[dict[str, Any]]:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -956,7 +956,7 @@ class Repository:
         return [dict(row) for row in rows]
 
     def get_discovery_seed(self, seed_id: int) -> dict[str, Any] | None:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             row = conn.execute(
                 "SELECT * FROM discovery_seeds WHERE id = ?",
                 (int(seed_id),),
@@ -988,6 +988,50 @@ class Repository:
                 params,
             ).fetchone()
         return int(row[0] if row else 0)
+
+    def count_video_discovery_seeds_by_channel_keys(self, rows: list[dict[str, Any]]) -> dict[str, int]:
+        id_values: set[str] = set()
+        name_values: set[str] = set()
+        for row in rows:
+            channel_id = str(row.get("channel_id") or "").strip()
+            if channel_id:
+                id_values.add(channel_id)
+                continue
+            channel = str(row.get("channel") or "").strip()
+            if channel:
+                name_values.add(channel.lower())
+
+        counts: dict[str, int] = {}
+        with self.db.connect() as conn:
+            if id_values:
+                placeholders = ",".join("?" for _ in id_values)
+                for row in conn.execute(
+                    f"""
+                    SELECT 'id:' || TRIM(v.channel_id) AS channel_key, COUNT(*) AS seed_count
+                    FROM discovery_seeds ds
+                    JOIN videos v ON ds.source_type = 'video' AND v.video_id = ds.value
+                    WHERE ds.enabled = 1
+                      AND TRIM(COALESCE(v.channel_id, '')) IN ({placeholders})
+                    GROUP BY TRIM(v.channel_id)
+                    """,
+                    tuple(sorted(id_values)),
+                ).fetchall():
+                    counts[str(row["channel_key"])] = int(row["seed_count"])
+            if name_values:
+                placeholders = ",".join("?" for _ in name_values)
+                for row in conn.execute(
+                    f"""
+                    SELECT 'name:' || LOWER(TRIM(v.channel)) AS channel_key, COUNT(*) AS seed_count
+                    FROM discovery_seeds ds
+                    JOIN videos v ON ds.source_type = 'video' AND v.video_id = ds.value
+                    WHERE ds.enabled = 1
+                      AND LOWER(TRIM(COALESCE(v.channel, ''))) IN ({placeholders})
+                    GROUP BY LOWER(TRIM(v.channel))
+                    """,
+                    tuple(sorted(name_values)),
+                ).fetchall():
+                    counts[str(row["channel_key"])] = int(row["seed_count"])
+        return counts
 
     def mark_discovery_seed_scanned(self, seed_id: int, *, delay_minutes: int = 240) -> None:
         timestamp = to_iso()
@@ -1505,7 +1549,7 @@ class Repository:
         return {"skipped": False, "inserted_videos": max(0, after - before)}
 
     def list_runs(self, limit: int = 25) -> list[dict[str, Any]]:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             rows = conn.execute(
                 "SELECT * FROM scrape_runs ORDER BY id DESC LIMIT ?",
                 (limit,),
@@ -1513,7 +1557,7 @@ class Repository:
         return [dict(row) for row in rows]
 
     def get_run(self, run_id: int) -> dict[str, Any] | None:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             row = conn.execute(
                 "SELECT * FROM scrape_runs WHERE id = ?", (run_id,)
             ).fetchone()
@@ -1847,7 +1891,7 @@ class Repository:
         *,
         classifier_version: int = CURRENT_DUB_CLASSIFIER_VERSION,
     ) -> int:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             return int(
                 conn.execute(
                     """
@@ -2390,7 +2434,7 @@ class Repository:
         year_after: int | None = None,
         year_before: int | None = None,
     ) -> int:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             search_mode = self._catalog_search_mode(conn, query) if query else "legacy"
             if search_mode == "none":
                 return 0
@@ -2438,7 +2482,7 @@ class Repository:
             "random": "v.random_key ASC, v.video_id ASC",
         }
 
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             search_mode = self._catalog_search_mode(conn, query) if query else "legacy"
             if search_mode == "none":
                 return {"items": [], "next_cursor": None, "total_estimate": None}
@@ -2629,7 +2673,7 @@ class Repository:
         return items
 
     def list_catalog_filters(self) -> dict[str, list[Any]]:
-        with self.db.connect() as conn:
+        with self.db.connect(profile="ui_read") as conn:
             channels = [
                 row[0]
                 for row in conn.execute(

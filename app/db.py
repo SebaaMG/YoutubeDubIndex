@@ -221,6 +221,7 @@ CREATE INDEX IF NOT EXISTS idx_feed_state_promoted ON feed_state(promoted_at DES
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.default_profile = "default"
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,19 +231,36 @@ class Database:
             conn.executescript(INDEXES)
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+    def connect(self, *, profile: str = "default") -> Iterator[sqlite3.Connection]:
+        requested_profile = self.default_profile if profile == "default" else profile
+        normalized_profile = requested_profile if requested_profile in {"default", "ui_read", "worker_write"} else "default"
+        timeout = 0.75 if normalized_profile == "ui_read" else 30
+        busy_timeout = 750 if normalized_profile == "ui_read" else 30000
+        read_only = normalized_profile == "ui_read"
+        conn = sqlite3.connect(self.path, timeout=timeout, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
+        if normalized_profile == "worker_write":
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+        if read_only:
+            conn.execute("PRAGMA query_only=ON")
         try:
             yield conn
-            conn.commit()
+            if not read_only:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if not read_only:
+                conn.rollback()
             raise
         finally:
             conn.close()
+
+    def checkpoint(self, *, mode: str = "PASSIVE") -> None:
+        safe_mode = mode if mode in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"} else "PASSIVE"
+        with self.connect(profile="worker_write") as conn:
+            conn.execute(f"PRAGMA wal_checkpoint({safe_mode})")
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:

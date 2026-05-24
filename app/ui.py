@@ -3,13 +3,27 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QPoint, QRect, QSize, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QImage, QMouseEvent, QPainter, QPixmap, QResizeEvent
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QWheelEvent,
+)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -32,6 +46,10 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyleOptionButton,
+    QStyleOptionComboBox,
+    QStylePainter,
     QStatusBar,
     QStyledItemDelegate,
     QTableWidget,
@@ -50,11 +68,37 @@ CATALOG_CARD_BATCH_SIZE = 32
 CATALOG_PAGE_SIZE = 160
 STARTUP_BACKFILL_DELAY_MS = 2500
 MANUAL_DISCOVERY_CANDIDATE_LIMIT = 200
-THUMBNAIL_RENDER_SCALE = 0.75
+THUMBNAIL_RENDER_SCALE = 1.0
 CATALOG_BACKGROUND_COUNT_MAX_VIDEOS = 100_000
 CATALOG_THUMBNAIL_PREFETCH_ROWS = 30
 THUMBNAIL_MAX_ACTIVE_REQUESTS = 6
 THUMBNAIL_MAX_PIXMAPS_PER_FRAME = 6
+CATALOG_WHEEL_STEP_PX = 72
+CATALOG_PIXEL_WHEEL_SCALE = 0.55
+
+CatalogScrollAnchor = tuple[str | None, int, int, int | None, int]
+
+
+def youtube_thumbnail_candidates(video_id: str | None, preferred_url: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str | None) -> None:
+        normalized = str(url or "").strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    add(preferred_url)
+    video_key = str(video_id or "").strip()
+    if video_key:
+        add(f"https://i.ytimg.com/vi/{video_key}/hq720.jpg")
+        add(f"https://i.ytimg.com/vi/{video_key}/sddefault.jpg")
+        add(f"https://i.ytimg.com/vi/{video_key}/hqdefault.jpg")
+        add(f"https://i.ytimg.com/vi/{video_key}/mqdefault.jpg")
+        add(f"https://i.ytimg.com/vi/{video_key}/default.jpg")
+    return candidates
 
 
 APP_STYLE = """
@@ -163,8 +207,12 @@ QPushButton[sourcePrimary="true"]:disabled {
     border-bottom: 3px solid #4f89b8;
     color: #c0ccd8;
 }
-QLineEdit[compactCatalog="true"], QComboBox[compactCatalog="true"] {
+QLineEdit[compactCatalog="true"] {
     padding: 6px 12px;
+    min-height: 22px;
+}
+QComboBox[compactCatalog="true"] {
+    padding: 6px 34px 6px 12px;
     min-height: 22px;
 }
 QPushButton[compactCatalog="true"] {
@@ -182,7 +230,7 @@ QLabel[filterHint="true"] {
     font-size: 11px;
 }
 QComboBox {
-    padding-right: 28px;
+    padding-right: 34px;
 }
 QComboBox::drop-down {
     subcontrol-origin: padding;
@@ -276,6 +324,24 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked {
     background: #1f75ee;
     border: 1px solid #2386ff;
+}
+QCheckBox[topbarAutoSearch="true"] {
+    color: #aeb8c9;
+    font-size: 13px;
+    font-weight: 700;
+    spacing: 8px;
+    padding: 0px 8px;
+}
+QCheckBox[topbarAutoSearch="true"]::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 1px solid #3f5062;
+    background: #0f1720;
+}
+QCheckBox[topbarAutoSearch="true"]::indicator:checked {
+    background: #0f1720;
+    border: 1px solid #25c8f5;
 }
 QCheckBox[catalogFavoriteFilter="true"] {
     color: #d8e0ed;
@@ -523,6 +589,56 @@ class ComboItemDelegate(QStyledItemDelegate):
         return size
 
 
+class CatalogFilterComboBox(QComboBox):
+    def __init__(self, display_prefix: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._display_prefix = display_prefix
+
+    def set_display_prefix(self, prefix: str) -> None:
+        self._display_prefix = prefix
+        self.update()
+
+    def display_text(self) -> str:
+        current = self.currentText()
+        if self._display_prefix and current:
+            return f"{self._display_prefix}: {current}"
+        return current
+
+    def paintEvent(self, event: Any) -> None:  # type: ignore[override]
+        painter = QStylePainter(self)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        option.currentText = self.display_text()
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
+        self._draw_chevron(painter, option)
+
+    def _draw_chevron(self, painter: QPainter, option: QStyleOptionComboBox) -> None:
+        arrow_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxArrow,
+            self,
+        )
+        if arrow_rect.isNull() or arrow_rect.width() < 10:
+            arrow_rect = QRect(self.width() - 32, 0, 24, self.height())
+        center = arrow_rect.center()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(
+            QPen(
+                QColor("#aeb8c9"),
+                2,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        painter.drawLine(QPoint(center.x() - 5, center.y() - 3), QPoint(center.x(), center.y() + 3))
+        painter.drawLine(QPoint(center.x(), center.y() + 3), QPoint(center.x() + 5, center.y() - 3))
+        painter.restore()
+
+
 def style_combo_popup(combo: QComboBox) -> None:
     combo.setView(QListView(combo))
     combo.view().setItemDelegate(ComboItemDelegate(combo.view()))
@@ -556,8 +672,8 @@ def style_combo_popup(combo: QComboBox) -> None:
     )
 
 
-def make_year_combo(empty_text: str) -> QComboBox:
-    combo = QComboBox()
+def make_year_combo(empty_text: str) -> CatalogFilterComboBox:
+    combo = CatalogFilterComboBox()
     combo.setEditable(False)
     combo.addItem(empty_text, None)
     current_year = datetime.now().year
@@ -1018,6 +1134,8 @@ class CatalogListModel(QAbstractListModel):
         return None
 
     def set_items(self, items: list[dict[str, Any]]) -> None:
+        if self.items == list(items):
+            return
         self.beginResetModel()
         self.items = list(items)
         self._index_thumbnail_rows()
@@ -1037,6 +1155,27 @@ class CatalogListModel(QAbstractListModel):
 
     def set_thumbnail(self, url: str, pixmap: QPixmap) -> None:
         self.set_thumbnails_batch({url: pixmap})
+
+    def set_thumbnail_url(self, row: int, url: str) -> None:
+        if row < 0 or row >= len(self.items):
+            return
+        normalized = str(url or "").strip()
+        if not normalized:
+            return
+        item = self.items[row]
+        old_url = str(item.get("thumbnail_url") or "")
+        if old_url == normalized:
+            return
+        if old_url:
+            rows = self._url_rows.get(old_url)
+            if rows is not None:
+                rows.discard(row)
+                if not rows:
+                    self._url_rows.pop(old_url, None)
+        item["thumbnail_url"] = normalized
+        self._url_rows.setdefault(normalized, set()).add(row)
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [CATALOG_ITEM_ROLE, CATALOG_PIXMAP_ROLE])
 
     def set_thumbnails_batch(self, pixmaps: dict[str, QPixmap]) -> None:
         changed_rows: set[int] = set()
@@ -1100,7 +1239,7 @@ class CatalogCardDelegate(QStyledItemDelegate):
         self.card_width = max(200, int(card_width))
         self.size_mode = size_mode
         thumb_height = self.thumbnail_height()
-        body_height = 162 if size_mode != "Compacto" else 138
+        body_height = 104 if size_mode != "Compacto" else 92
         self.card_height = thumb_height + body_height
 
     def thumbnail_height(self) -> int:
@@ -1281,10 +1420,10 @@ class CatalogCardDelegate(QStyledItemDelegate):
 
         left = card_rect.left() + 14
         right = card_rect.right() - 14
-        content_top = thumb_rect.bottom() + (15 if self.size_mode != "Compacto" else 12)
-        title_font = self._font(18 if self.size_mode != "Compacto" else 16, bold=True)
-        title_metrics = self._font_metrics(18 if self.size_mode != "Compacto" else 16, bold=True)
-        max_title_lines = 3 if self.size_mode != "Compacto" else 2
+        content_top = thumb_rect.bottom() + (8 if self.size_mode != "Compacto" else 6)
+        title_font = self._font(16 if self.size_mode != "Compacto" else 14, bold=True)
+        title_metrics = self._font_metrics(16 if self.size_mode != "Compacto" else 14, bold=True)
+        max_title_lines = 2
         title_rect = QRect(
             left,
             content_top,
@@ -1300,11 +1439,11 @@ class CatalogCardDelegate(QStyledItemDelegate):
             max_title_lines,
         )
 
-        channel_font = self._font(15 if self.size_mode != "Compacto" else 13)
+        channel_font = self._font(13 if self.size_mode != "Compacto" else 12)
         painter.setFont(channel_font)
         painter.setPen(QColor("#a2abb9"))
-        channel_metrics = self._font_metrics(15 if self.size_mode != "Compacto" else 13)
-        channel_top = content_top + used_title_height + 8
+        channel_metrics = self._font_metrics(13 if self.size_mode != "Compacto" else 12)
+        channel_top = content_top + used_title_height + 4
         channel_rect = QRect(left, channel_top, right - left, channel_metrics.lineSpacing())
         channel_text = channel_metrics.elidedText(
             str(item.get("channel") or "Canal desconocido"),
@@ -1317,13 +1456,13 @@ class CatalogCardDelegate(QStyledItemDelegate):
             channel_text,
         )
 
-        meta_font = self._font(14 if self.size_mode != "Compacto" else 12)
+        meta_font = self._font(12 if self.size_mode != "Compacto" else 11)
         painter.setFont(meta_font)
         painter.setPen(QColor("#a0a8b5"))
-        meta_metrics = self._font_metrics(14 if self.size_mode != "Compacto" else 12)
+        meta_metrics = self._font_metrics(12 if self.size_mode != "Compacto" else 11)
         meta_top = min(
-            channel_rect.bottom() + 9,
-            card_rect.bottom() - meta_metrics.lineSpacing() - 16,
+            channel_rect.bottom() + 3,
+            card_rect.bottom() - meta_metrics.lineSpacing() - 6,
         )
         meta_rect = QRect(left, meta_top, right - left - 28, meta_metrics.lineSpacing())
         meta_text = self._published_text(item)
@@ -1362,7 +1501,9 @@ class CatalogListView(QListView):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setSpacing(16)
+        self.setSpacing(12)
+        self.verticalScrollBar().setSingleStep(CATALOG_WHEEL_STEP_PX)
+        self._wheel_remainder = 0.0
         self.verticalScrollBar().valueChanged.connect(self._handle_scroll)
         self.setStyleSheet(
             """
@@ -1424,11 +1565,71 @@ class CatalogListView(QListView):
         super().resizeEvent(event)
         self.visibleRowsChanged.emit()
 
+    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        bar = self.verticalScrollBar()
+        pixel_delta = event.pixelDelta().y()
+        if pixel_delta:
+            delta = float(pixel_delta) * CATALOG_PIXEL_WHEEL_SCALE
+        else:
+            delta = (float(event.angleDelta().y()) / 120.0) * CATALOG_WHEEL_STEP_PX
+        if not delta:
+            event.accept()
+            return
+        adjusted_delta = delta + self._wheel_remainder
+        whole_delta = int(adjusted_delta)
+        self._wheel_remainder = adjusted_delta - whole_delta
+        old_value = bar.value()
+        if whole_delta:
+            target_value = max(bar.minimum(), min(bar.maximum(), old_value - whole_delta))
+            bar.setValue(target_value)
+            if (
+                whole_delta < 0
+                and target_value == old_value
+                and bar.maximum() - target_value < max(240, self.height())
+            ):
+                self.nearBottom.emit()
+        event.accept()
+
     def _handle_scroll(self, value: int) -> None:
         bar = self.verticalScrollBar()
         if bar.maximum() - value < max(240, self.height()):
             self.nearBottom.emit()
         self.visibleRowsChanged.emit()
+
+
+class TickCheckBox(QCheckBox):
+    def paintEvent(self, event: Any) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        indicator = self.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, self)
+        if indicator.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(
+            QPen(
+                QColor("#f4f7fc"),
+                max(2, round(indicator.width() * 0.14)),
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        left = indicator.left()
+        top = indicator.top()
+        width = indicator.width()
+        height = indicator.height()
+        painter.drawLine(
+            QPoint(left + round(width * 0.24), top + round(height * 0.54)),
+            QPoint(left + round(width * 0.43), top + round(height * 0.72)),
+        )
+        painter.drawLine(
+            QPoint(left + round(width * 0.43), top + round(height * 0.72)),
+            QPoint(left + round(width * 0.76), top + round(height * 0.30)),
+        )
 
 
 class ThumbnailService(QObject):
@@ -1452,7 +1653,9 @@ class ThumbnailService(QObject):
         self._memory_bytes = 0
         self._cache: OrderedDict[tuple[str, int, int], QPixmap] = OrderedDict()
         self._inflight: dict[tuple[str, int, int], list[Callable[[QPixmap], None]]] = {}
+        self._inflight_failures: dict[tuple[str, int, int], list[Callable[[], None]]] = {}
         self._pending: OrderedDict[tuple[str, int, int], list[Callable[[QPixmap], None]]] = OrderedDict()
+        self._pending_failures: dict[tuple[str, int, int], list[Callable[[], None]]] = {}
         self._active_replies: dict[tuple[str, int, int], Any] = {}
         self._decoded_queue: OrderedDict[tuple[str, int, int], QImage] = OrderedDict()
         self._dropped_pending = 0
@@ -1469,7 +1672,13 @@ class ThumbnailService(QObject):
         self._pixmap_timer.timeout.connect(self._flush_decoded_queue)
         self.decodedReady.connect(self._handle_decoded)
 
-    def request(self, url: str, target_size: QSize, callback: Callable[[QPixmap], None]) -> None:
+    def request(
+        self,
+        url: str,
+        target_size: QSize,
+        callback: Callable[[QPixmap], None],
+        error_callback: Callable[[], None] | None = None,
+    ) -> None:
         if not url or self._closed:
             return
         key = (url, max(1, target_size.width()), max(1, target_size.height()))
@@ -1480,12 +1689,47 @@ class ThumbnailService(QObject):
             return
         if key in self._inflight:
             self._inflight[key].append(callback)
+            if error_callback is not None:
+                self._inflight_failures.setdefault(key, []).append(error_callback)
             return
         if key in self._pending:
             self._pending[key].append(callback)
+            if error_callback is not None:
+                self._pending_failures.setdefault(key, []).append(error_callback)
             return
         self._pending[key] = [callback]
+        if error_callback is not None:
+            self._pending_failures[key] = [error_callback]
         self._pump_requests()
+
+    def request_with_fallbacks(
+        self,
+        urls: list[str],
+        target_size: QSize,
+        callback: Callable[[QPixmap], None],
+    ) -> None:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            normalized = str(url or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append(normalized)
+        if not candidates or self._closed:
+            return
+
+        def request_at(index: int) -> None:
+            if self._closed or index >= len(candidates):
+                return
+            self.request(
+                candidates[index],
+                target_size,
+                callback,
+                error_callback=lambda next_index=index + 1: request_at(next_index),
+            )
+
+        request_at(0)
 
     def active_request_count(self) -> int:
         return len(self._active_replies)
@@ -1500,11 +1744,13 @@ class ThumbnailService(QObject):
         if not allowed_keys:
             dropped = len(self._pending)
             self._pending.clear()
+            self._pending_failures.clear()
             self._dropped_pending += dropped
             return
         for key in list(self._pending.keys()):
             if key not in allowed_keys:
                 self._pending.pop(key, None)
+                self._pending_failures.pop(key, None)
                 self._dropped_pending += 1
 
     def _pump_requests(self) -> None:
@@ -1512,6 +1758,7 @@ class ThumbnailService(QObject):
             return
         while len(self._active_replies) < self.max_active_requests and self._pending:
             key, callbacks = self._pending.popitem(last=False)
+            failure_callbacks = self._pending_failures.pop(key, [])
             cached = self._cache.get(key)
             if cached is not None:
                 self._cache.move_to_end(key)
@@ -1519,6 +1766,7 @@ class ThumbnailService(QObject):
                     QTimer.singleShot(0, lambda pixmap=cached, callback=callback: callback(pixmap))
                 continue
             self._inflight[key] = callbacks
+            self._inflight_failures[key] = failure_callbacks
             reply = self.manager.get(QNetworkRequest(QUrl(key[0])))
             self._active_replies[key] = reply
             reply.finished.connect(lambda reply=reply, key=key: self._finish(reply, key))
@@ -1526,14 +1774,18 @@ class ThumbnailService(QObject):
     def _finish(self, reply: QNetworkReply, key: tuple[str, int, int]) -> None:
         try:
             self._active_replies.pop(key, None)
-            if self._closed or reply.error() != QNetworkReply.NetworkError.NoError:
+            if self._closed:
                 self._inflight.pop(key, None)
+                self._inflight_failures.pop(key, None)
+                return
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self._fail_request(key)
                 return
             data = bytes(reply.readAll())
             try:
                 self._decode_pool.submit(self._decode_and_emit, key, data)
             except RuntimeError:
-                self._inflight.pop(key, None)
+                self._fail_request(key)
         finally:
             reply.deleteLater()
             self._pump_requests()
@@ -1573,19 +1825,40 @@ class ThumbnailService(QObject):
             callbacks = self._inflight.pop(key, [])
             processed += 1
             if image.isNull():
+                self._fail_request(key)
                 continue
             pixmap = QPixmap.fromImage(image)
             self._remember(key, pixmap)
+            self._inflight_failures.pop(key, None)
             for callback in callbacks:
                 callback(pixmap)
         if self._decoded_queue:
             self._pixmap_timer.start()
 
+    def _fail_request(self, key: tuple[str, int, int]) -> None:
+        self._inflight.pop(key, None)
+        failure_callbacks = self._inflight_failures.pop(key, [])
+        for callback in failure_callbacks:
+            QTimer.singleShot(0, callback)
+
     def shutdown(self) -> None:
         self._closed = True
         self._pixmap_timer.stop()
         self._pending.clear()
+        self._pending_failures.clear()
         self._inflight.clear()
+        self._inflight_failures.clear()
+        for reply in list(self._active_replies.values()):
+            try:
+                if hasattr(reply, "abort"):
+                    reply.abort()
+            except Exception:
+                pass
+            try:
+                if hasattr(reply, "deleteLater"):
+                    reply.deleteLater()
+            except Exception:
+                pass
         self._active_replies.clear()
         self._decoded_queue.clear()
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
@@ -1606,10 +1879,20 @@ class ThumbnailService(QObject):
 
 
 class UiJankProbe(QObject):
-    def __init__(self, parent: QObject | None = None, *, interval_ms: int = 16, report_ms: int = 10_000) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        interval_ms: int = 16,
+        report_ms: int = 10_000,
+        jsonl_path: Path | None = None,
+        context_provider: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._interval_ms = max(1, int(interval_ms))
         self._report_ms = max(1000, int(report_ms))
+        self._jsonl_path = jsonl_path
+        self._context_provider = context_provider
         self._samples: list[float] = []
         self._last = time.perf_counter()
         self._last_report = self._last
@@ -1640,6 +1923,27 @@ class UiJankProbe(QObject):
         p99 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
         max_gap = ordered[-1]
         over_100 = sum(1 for sample in ordered if sample > 100.0)
+        payload = {
+            "event": "ui_jank",
+            "samples": len(ordered),
+            "p95_ms": round(p95, 2),
+            "p99_ms": round(p99, 2),
+            "max_gap_ms": round(max_gap, 2),
+            "over_100": over_100,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if self._context_provider is not None:
+            try:
+                payload.update(self._context_provider())
+            except Exception:
+                pass
+        if self._jsonl_path is not None:
+            try:
+                self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._jsonl_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            except Exception:
+                pass
         print(
             f"[ui-jank] samples={len(ordered)} p95={p95:.1f}ms p99={p99:.1f}ms "
             f"max={max_gap:.1f}ms over100={over_100}",
@@ -1805,6 +2109,8 @@ class MainWindow(QMainWindow):
         self._catalog_count_pending = False
         self._catalog_count_exact = False
         self._catalog_loading_page = False
+        self._catalog_loading_append = False
+        self._catalog_refresh_deferred_after_append = False
         self._catalog_query_generation = 0
         self._current_page_key: str | None = None
         self._catalog_dirty = True
@@ -1843,6 +2149,13 @@ class MainWindow(QMainWindow):
         self._catalog_visible_thumbnail_urls: set[str] = set()
         self._catalog_pending_thumbnail_pixmaps: dict[str, QPixmap] = {}
         self._ui_jank_probe: UiJankProbe | None = None
+        self._last_worker_pause_sent = 0.0
+        self._catalog_restore_scroll_generation: int | None = None
+        self._catalog_restore_scroll_anchor: CatalogScrollAnchor | None = None
+        self._catalog_append_scroll_anchor: CatalogScrollAnchor | None = None
+        self._catalog_scroll_restore_token = 0
+        self._catalog_scroll_range_restore_handler: Callable[[int, int], None] | None = None
+        self._suppress_next_catalog_near_bottom = False
         self.topbar_quick_input: QLineEdit | None = None
         self._sources_layout_mode: str | None = None
         self._closing = False
@@ -1919,6 +2232,13 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, nav_key=key: self.switch_page(nav_key))
             self._nav_buttons[key] = button
             shell_layout.addWidget(button)
+
+        self.automatic_discovery_toggle = TickCheckBox("Búsqueda Automática")
+        self.automatic_discovery_toggle.setProperty("topbarAutoSearch", "true")
+        self.automatic_discovery_toggle.setToolTip("Activa o pausa la búsqueda automática en segundo plano")
+        self.automatic_discovery_toggle.setChecked(self.controller.automatic_discovery_enabled())
+        self.automatic_discovery_toggle.toggled.connect(self.handle_automatic_discovery_toggled)
+        shell_layout.addWidget(self.automatic_discovery_toggle)
 
         shell_layout.addStretch(1)
 
@@ -2004,8 +2324,23 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.startup_backfill_timer.start()
         if os.environ.get("DUBINDEX_PERF_PROBE") == "1":
-            self._ui_jank_probe = UiJankProbe(self)
+            raw_path = os.environ.get("DUBINDEX_PERF_PROBE_PATH", "").strip()
+            jsonl_path = Path(raw_path) if raw_path else self.services.settings.data_dir / "ui_jank_probe.jsonl"
+            self._ui_jank_probe = UiJankProbe(self, jsonl_path=jsonl_path, context_provider=self._ui_perf_context)
             self._ui_jank_probe.start()
+
+    def _ui_perf_context(self) -> dict[str, Any]:
+        thumbnail_service = getattr(self, "thumbnail_service", None)
+        return {
+            "active_run_id": self.controller.active_run_id(),
+            "manual_discovery_running": self._manual_discovery_running,
+            "interest_discovery_active": self._interest_discovery_active,
+            "catalog_rows": len(self._catalog_rows),
+            "catalog_loading_page": self._catalog_loading_page,
+            "thumbnail_pending": len(getattr(thumbnail_service, "_pending", {}) or {}),
+            "thumbnail_inflight": len(getattr(thumbnail_service, "_inflight", {}) or {}),
+            "thumbnail_decode_queue": len(getattr(thumbnail_service, "_decoded_queue", {}) or {}),
+        }
 
     def _configure_table(self, table: QTableWidget, stretch_column: int | None = None) -> None:
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2468,7 +2803,7 @@ class MainWindow(QMainWindow):
         self.catalog_query.setMaximumHeight(36)
         self.catalog_query.returnPressed.connect(self.refresh_catalog)
 
-        self.catalog_lang = QComboBox()
+        self.catalog_lang = CatalogFilterComboBox("Idioma")
         self.catalog_lang.setProperty("compactCatalog", "true")
         self.catalog_lang.addItem("Todos los idiomas", "")
         self.catalog_lang.addItem("Español", SPANISH_LANGUAGE_FILTER)
@@ -2477,32 +2812,32 @@ class MainWindow(QMainWindow):
         self.catalog_lang.setMinimumHeight(36)
         self.catalog_lang.setMaximumHeight(36)
 
-        self.catalog_channel = QComboBox()
+        self.catalog_channel = CatalogFilterComboBox()
         self.catalog_channel.addItem("Todos los canales", "")
         self.catalog_channel.setMinimumWidth(220)
 
-        self.catalog_source = QComboBox()
+        self.catalog_source = CatalogFilterComboBox()
         self.catalog_source.addItem("Todos los intereses", None)
         self.catalog_source.setMinimumWidth(220)
 
-        self.catalog_visibility = QComboBox()
+        self.catalog_visibility = CatalogFilterComboBox()
         self.catalog_visibility.addItem("Solo doblados", True)
         self.catalog_visibility.addItem("Todos los videos revisados", False)
         self.catalog_visibility.setMinimumWidth(220)
 
-        self.catalog_dub_kind = QComboBox()
+        self.catalog_dub_kind = CatalogFilterComboBox()
         self.catalog_dub_kind.addItem("Todos los dubs", "")
         self.catalog_dub_kind.addItem("Doblaje automático", "automatic")
         self.catalog_dub_kind.addItem("Doblaje manual", "manual")
         self.catalog_dub_kind.setMinimumWidth(220)
 
-        self.catalog_sort = QComboBox()
+        self.catalog_sort = CatalogFilterComboBox("Ordenar por")
         self.catalog_sort.setProperty("compactCatalog", "true")
         self.catalog_sort.addItem("Más recientes", "recent")
         self.catalog_sort.addItem("Más antiguos", "oldest")
         self.catalog_sort.addItem("Más vistos", "views")
         self.catalog_sort.addItem("Random", "random")
-        self.catalog_sort.setMinimumWidth(170)
+        self.catalog_sort.setMinimumWidth(270)
         self.catalog_sort.setMinimumHeight(36)
         self.catalog_sort.setMaximumHeight(36)
 
@@ -2674,7 +3009,7 @@ class MainWindow(QMainWindow):
         self.catalog_view.openRequested.connect(self.open_catalog_video)
         self.catalog_view.favoriteToggled.connect(self.toggle_catalog_favorite)
         self.catalog_view.nearBottom.connect(self.load_next_catalog_page)
-        self.catalog_view.visibleRowsChanged.connect(self.schedule_visible_catalog_thumbnails)
+        self.catalog_view.visibleRowsChanged.connect(self.handle_catalog_visible_rows_changed)
         catalog_grid_layout.addWidget(self.catalog_view)
         layout.addWidget(self.catalog_grid_host, 1)
 
@@ -2815,6 +3150,26 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(80, self.request_catalog_filters_refresh)
             if hasattr(self, "catalog_page_refresh_timer"):
                 self.catalog_page_refresh_timer.start()
+
+    def handle_automatic_discovery_toggled(self, enabled: bool) -> None:
+        desired = bool(enabled)
+
+        def action() -> bool:
+            self.controller.set_automatic_discovery_enabled(desired)
+            return desired
+
+        def rollback(error: Exception) -> None:
+            self.automatic_discovery_toggle.blockSignals(True)
+            self.automatic_discovery_toggle.setChecked(not desired)
+            self.automatic_discovery_toggle.blockSignals(False)
+            self.show_error("No se pudo cambiar la busqueda automatica", error)
+
+        self._run_ui_action_async(
+            "automatic-discovery",
+            action,
+            on_error=rollback,
+            busy_widgets=[self.automatic_discovery_toggle],
+        )
 
     def selected_source(self) -> dict[str, Any] | None:
         selected = self.selected_sources()
@@ -4087,21 +4442,170 @@ class MainWindow(QMainWindow):
             return
 
         filters = self._current_catalog_filters()
+        same_filter_refresh = (
+            bool(self._catalog_rows)
+            and filters == self._catalog_filter_state
+            and hasattr(self, "catalog_view")
+        )
+        if same_filter_refresh:
+            self._catalog_restore_scroll_anchor = self._capture_catalog_scroll_anchor()
+        else:
+            self._catalog_restore_scroll_anchor = None
+        if same_filter_refresh and self._catalog_loading_page and self._catalog_loading_append:
+            self._catalog_refresh_deferred_after_append = True
+            return
         self._catalog_filter_state = filters
         self._catalog_query_generation += 1
         generation = self._catalog_query_generation
+        self._catalog_restore_scroll_generation = generation if self._catalog_restore_scroll_anchor else None
         self._catalog_loading_page = False
+        self._catalog_loading_append = False
+        if not same_filter_refresh:
+            self._catalog_refresh_deferred_after_append = False
         self._catalog_next_cursor = None
-        self._catalog_count_pending = False
-        self._catalog_count_exact = False
-        self._catalog_total_count = 0
-        self._catalog_rows = []
+        if not same_filter_refresh:
+            self._catalog_count_pending = False
+            self._catalog_count_exact = False
+            self._catalog_total_count = 0
+            self._catalog_rows = []
         self._catalog_loading_page = True
-        if hasattr(self, "catalog_model"):
+        if hasattr(self, "catalog_model") and not same_filter_refresh:
             self.catalog_model.set_items([])
             self._sync_catalog_card_compat_widgets()
             self.update_catalog_results_count()
-        self.start_catalog_page_worker(generation, filters, cursor=None, append=False)
+        page_size = self._catalog_refresh_page_size(same_filter_refresh)
+        self.start_catalog_page_worker(generation, filters, cursor=None, append=False, page_size=page_size)
+
+    def _catalog_refresh_page_size(self, same_filter_refresh: bool) -> int:
+        if not same_filter_refresh:
+            return CATALOG_PAGE_SIZE
+        loaded_count = len(self._catalog_rows)
+        if hasattr(self, "catalog_model"):
+            loaded_count = max(loaded_count, self.catalog_model.rowCount())
+        return max(CATALOG_PAGE_SIZE, loaded_count)
+
+    def _capture_catalog_scroll_anchor(self) -> CatalogScrollAnchor | None:
+        if not hasattr(self, "catalog_view") or not hasattr(self, "catalog_model"):
+            return None
+        bar = self.catalog_view.verticalScrollBar()
+        scroll_value = int(bar.value())
+        if scroll_value <= 0:
+            return None
+        bottom_distance = max(0, int(bar.maximum()) - scroll_value)
+        viewport = self.catalog_view.viewport()
+        anchor_index = QModelIndex()
+        for y in (8, 32, 64, max(8, viewport.height() // 3)):
+            anchor_index = self.catalog_view.indexAt(QPoint(8, y))
+            if anchor_index.isValid():
+                break
+        if not anchor_index.isValid():
+            return (None, 0, scroll_value, None, bottom_distance)
+        item = anchor_index.data(CATALOG_ITEM_ROLE)
+        video_id = str(item.get("video_id") or "") if isinstance(item, dict) else ""
+        offset = self.catalog_view.visualRect(anchor_index).top()
+        return (video_id or None, int(offset), scroll_value, int(anchor_index.row()), bottom_distance)
+
+    def _restore_catalog_scroll_anchor_if_needed(self, generation: int) -> None:
+        if self._catalog_restore_scroll_generation != generation or self._catalog_restore_scroll_anchor is None:
+            return
+        anchor = self._catalog_restore_scroll_anchor
+        self._catalog_restore_scroll_generation = None
+        self._catalog_restore_scroll_anchor = None
+        self._restore_catalog_scroll_anchor(anchor)
+
+    def _apply_catalog_scroll_anchor(self, anchor: CatalogScrollAnchor | None) -> None:
+        if anchor is None:
+            return
+        if self._closing or not hasattr(self, "catalog_view") or not hasattr(self, "catalog_model"):
+            return
+        video_id, offset, fallback_value, old_row, bottom_distance = anchor
+        bar = self.catalog_view.verticalScrollBar()
+        if bottom_distance <= max(240, self.catalog_view.height()):
+            target_value = max(0, min(bar.maximum(), bar.maximum() - bottom_distance))
+            self._set_catalog_near_bottom_suppressed_once()
+            bar.setValue(target_value)
+            self.schedule_visible_catalog_thumbnails()
+            return
+        restored = False
+        if video_id:
+            for row, item in enumerate(self.catalog_model.items):
+                if str(item.get("video_id") or "") != video_id:
+                    continue
+                if old_row == row:
+                    bar.setValue(max(0, min(bar.maximum(), fallback_value)))
+                else:
+                    index = self.catalog_model.index(row, 0)
+                    self.catalog_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtTop)
+                    bar.setValue(max(0, min(bar.maximum(), bar.value() - offset)))
+                restored = True
+                break
+        if not restored:
+            bar.setValue(max(0, min(bar.maximum(), fallback_value)))
+        self.schedule_visible_catalog_thumbnails()
+
+    def _restore_catalog_scroll_anchor(self, anchor: CatalogScrollAnchor | None) -> None:
+        if anchor is None:
+            return
+        QTimer.singleShot(0, lambda: self._apply_catalog_scroll_anchor(anchor))
+
+    def _stop_catalog_scroll_range_restore(self, token: int | None = None) -> None:
+        if token is not None and token != self._catalog_scroll_restore_token:
+            return
+        handler = self._catalog_scroll_range_restore_handler
+        if handler is None or not hasattr(self, "catalog_view"):
+            self._catalog_scroll_range_restore_handler = None
+            return
+        try:
+            self.catalog_view.verticalScrollBar().rangeChanged.disconnect(handler)
+        except (RuntimeError, TypeError):
+            pass
+        self._catalog_scroll_range_restore_handler = None
+
+    def _start_catalog_scroll_range_restore(self, anchor: CatalogScrollAnchor | None) -> int:
+        self._catalog_scroll_restore_token += 1
+        token = self._catalog_scroll_restore_token
+        self._stop_catalog_scroll_range_restore()
+        if anchor is None or not hasattr(self, "catalog_view"):
+            return token
+        remaining_updates = 12
+        bar = self.catalog_view.verticalScrollBar()
+
+        def restore_on_range_change(_minimum: int, _maximum: int) -> None:
+            nonlocal remaining_updates
+            if token != self._catalog_scroll_restore_token:
+                return
+            remaining_updates -= 1
+            self._apply_catalog_scroll_anchor(anchor)
+            if remaining_updates <= 0:
+                self._stop_catalog_scroll_range_restore(token)
+
+        self._catalog_scroll_range_restore_handler = restore_on_range_change
+        bar.rangeChanged.connect(restore_on_range_change)
+        QTimer.singleShot(250, lambda: self._stop_catalog_scroll_range_restore(token))
+        return token
+
+    def _append_catalog_items_preserving_scroll(
+        self,
+        rows: list[dict[str, Any]],
+        anchor: CatalogScrollAnchor | None,
+    ) -> None:
+        self._start_catalog_scroll_range_restore(anchor)
+        previous_layout_mode = self.catalog_view.layoutMode()
+        try:
+            self.catalog_view.setLayoutMode(QListView.LayoutMode.SinglePass)
+            self.catalog_model.append_items(rows)
+            self.catalog_view.doItemsLayout()
+        finally:
+            self.catalog_view.setLayoutMode(previous_layout_mode)
+        self._apply_catalog_scroll_anchor(anchor)
+        QTimer.singleShot(0, lambda: self._apply_catalog_scroll_anchor(anchor))
+
+    def _set_catalog_near_bottom_suppressed_once(self) -> None:
+        self._suppress_next_catalog_near_bottom = True
+        QTimer.singleShot(0, self._clear_catalog_near_bottom_suppression)
+
+    def _clear_catalog_near_bottom_suppression(self) -> None:
+        self._suppress_next_catalog_near_bottom = False
 
     def start_catalog_page_worker(
         self,
@@ -4110,7 +4614,10 @@ class MainWindow(QMainWindow):
         *,
         cursor: str | None,
         append: bool,
+        page_size: int | None = None,
     ) -> None:
+        requested_page_size = max(1, int(page_size or CATALOG_PAGE_SIZE))
+
         def worker() -> None:
             payload: dict[str, Any]
             try:
@@ -4126,7 +4633,7 @@ class MainWindow(QMainWindow):
                     year=filters.get("year"),
                     year_after=filters.get("year_after"),
                     year_before=filters.get("year_before"),
-                    page_size=CATALOG_PAGE_SIZE,
+                    page_size=requested_page_size,
                     cursor=cursor,
                 )
             except Exception as exc:
@@ -4147,19 +4654,24 @@ class MainWindow(QMainWindow):
         if generation != self._catalog_query_generation or self._closing:
             return
         self._catalog_loading_page = False
+        if append:
+            self._catalog_loading_append = False
         error = page.get("error")
         if error:
             self.statusBar().showMessage(str(error), 6000)
             if not append:
                 self.update_catalog_surface()
+            self._run_deferred_catalog_refresh_after_append()
             return
 
         rows = list(page.get("items") or [])
         self._catalog_next_cursor = page.get("next_cursor")
         if append:
+            append_anchor = self._catalog_append_scroll_anchor
+            self._catalog_append_scroll_anchor = None
             if rows:
                 self._catalog_rows.extend(rows)
-                self.catalog_model.append_items(rows)
+                self._append_catalog_items_preserving_scroll(rows, append_anchor)
                 self._sync_catalog_card_compat_widgets()
                 self.schedule_visible_catalog_thumbnails()
             if self._catalog_count_exact:
@@ -4169,6 +4681,7 @@ class MainWindow(QMainWindow):
                 self._catalog_total_count = len(self._catalog_rows)
                 self._catalog_count_exact = not self._catalog_count_pending
             self.update_catalog_results_count()
+            self._run_deferred_catalog_refresh_after_append()
             return
 
         self._catalog_count_pending = bool(self._catalog_next_cursor)
@@ -4201,8 +4714,15 @@ class MainWindow(QMainWindow):
             self.update_catalog_surface()
         else:
             self.render_catalog_cards()
+        self._restore_catalog_scroll_anchor_if_needed(generation)
         if self._catalog_count_pending and self.should_count_catalog_exactly(dict(self._catalog_filter_state)):
             self.start_catalog_count_worker(generation, dict(self._catalog_filter_state))
+
+    def _run_deferred_catalog_refresh_after_append(self) -> None:
+        if not self._catalog_refresh_deferred_after_append or self._closing:
+            return
+        self._catalog_refresh_deferred_after_append = False
+        QTimer.singleShot(0, self.refresh_catalog)
 
     def should_count_catalog_exactly(self, filters: dict[str, Any]) -> bool:
         total_videos = int(self._latest_stats.get("total_videos") or 0)
@@ -4251,15 +4771,20 @@ class MainWindow(QMainWindow):
         self.update_catalog_results_count()
 
     def load_next_catalog_page(self) -> None:
+        if self._suppress_next_catalog_near_bottom:
+            self._suppress_next_catalog_near_bottom = False
+            return
         if self._catalog_loading_page or not self._catalog_next_cursor:
             return
         if self._current_page_key != "catalog":
             return
+        self._catalog_append_scroll_anchor = self._capture_catalog_scroll_anchor()
         self._catalog_loading_page = True
+        self._catalog_loading_append = True
         generation = self._catalog_query_generation
         filters = dict(self._catalog_filter_state)
         cursor = self._catalog_next_cursor
-        self.start_catalog_page_worker(generation, filters, cursor=cursor, append=True)
+        self.start_catalog_page_worker(generation, filters, cursor=cursor, append=True, page_size=CATALOG_PAGE_SIZE)
 
     def start_metadata_backfill_if_needed(self) -> None:
         if self._metadata_backfill_loading or self._closing:
@@ -4367,6 +4892,24 @@ class MainWindow(QMainWindow):
         if hasattr(self, "catalog_thumbnail_timer") and not self._closing:
             self.catalog_thumbnail_timer.start()
 
+    def handle_catalog_visible_rows_changed(self) -> None:
+        self.schedule_visible_catalog_thumbnails()
+        self.pause_background_worker_briefly()
+
+    def pause_background_worker_briefly(self) -> None:
+        now = time.monotonic()
+        if now - self._last_worker_pause_sent < 0.35:
+            return
+        self._last_worker_pause_sent = now
+
+        def worker() -> None:
+            try:
+                self.controller.pause_background(seconds=0.5)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="worker-pause-scroll").start()
+
     def request_visible_catalog_thumbnails(self) -> None:
         if not hasattr(self, "catalog_view") or not self.catalog_view.isVisible():
             return
@@ -4388,25 +4931,32 @@ class MainWindow(QMainWindow):
         generation = self._catalog_query_generation
         visible_urls: set[str] = set()
         allowed_keys: set[tuple[str, int, int]] = set()
-        rows_to_request: list[tuple[str, dict[str, Any]]] = []
+        rows_to_request: list[tuple[str, list[str]]] = []
         for row in range(first_row, last_row + 1):
             item = model.item_at(row)
             if not item:
                 continue
-            url = str(item.get("thumbnail_url") or "")
-            if not url:
+            stored_url = str(item.get("thumbnail_url") or "")
+            candidates = youtube_thumbnail_candidates(str(item.get("video_id") or ""), stored_url)
+            if not candidates:
                 continue
-            visible_urls.add(url)
-            allowed_keys.add((url, max(1, target_size.width()), max(1, target_size.height())))
-            rows_to_request.append((url, item))
+            primary_url = stored_url or candidates[0]
+            if not stored_url:
+                model.set_thumbnail_url(row, primary_url)
+            visible_urls.add(primary_url)
+            for url in candidates:
+                allowed_keys.add((url, max(1, target_size.width()), max(1, target_size.height())))
+            rows_to_request.append((primary_url, candidates))
         self._catalog_visible_thumbnail_urls = visible_urls
         if hasattr(self.thumbnail_service, "prune_pending"):
             self.thumbnail_service.prune_pending(allowed_keys)
-        for url, _item in rows_to_request:
-            self.thumbnail_service.request(
-                url,
+        for primary_url, candidates in rows_to_request:
+            self.thumbnail_service.request_with_fallbacks(
+                candidates,
                 target_size,
-                lambda pixmap, url=url, generation=generation: self.apply_catalog_thumbnail(url, pixmap, generation),
+                lambda pixmap, url=primary_url, generation=generation: self.apply_catalog_thumbnail(
+                    url, pixmap, generation
+                ),
             )
 
     def apply_catalog_thumbnail(self, url: str, pixmap: QPixmap, generation: int) -> None:
@@ -4507,6 +5057,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:  # type: ignore[override]
         self._closing = True
+        self._catalog_scroll_restore_token += 1
+        self._stop_catalog_scroll_range_restore()
         self._catalog_render_token += 1
         self._catalog_batch_state = None
         for timer_name in (
@@ -4523,6 +5075,8 @@ class MainWindow(QMainWindow):
                 timer.stop()
         if self.services.discovery_loop is not None:
             self.services.discovery_loop.stop()
+        if self.services.worker_client is not None and hasattr(self.services.worker_client, "stop"):
+            self.services.worker_client.stop(wait=False)
         if self._ui_jank_probe is not None:
             self._ui_jank_probe.stop()
         if hasattr(self, "thumbnail_service"):

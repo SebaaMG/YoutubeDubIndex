@@ -20,7 +20,7 @@ from app.db import Database  # noqa: E402
 from app.desktop_services import AppController, DesktopServices  # noqa: E402
 from app.repository import Repository  # noqa: E402
 from app.ui import APP_STYLE, MainWindow  # noqa: E402
-from app.youtube import StartupDiagnostics, YouTubeService  # noqa: E402
+from app.youtube import StartupDiagnostics  # noqa: E402
 
 
 class IdleRunner:
@@ -82,7 +82,7 @@ def main() -> None:
         settings=settings,
         db=db,
         repo=repo,
-        youtube=YouTubeService(settings),
+        youtube=None,
         runner=IdleRunner(),
         diagnostics=StartupDiagnostics(node_ok=True, ytdlp_ok=True, messages=[]),
     )

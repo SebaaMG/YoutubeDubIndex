@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
 
@@ -13,16 +14,20 @@ from .run_manager import RunManager
 from .youtube import StartupDiagnostics, YouTubeService
 
 
+AUTOMATIC_DISCOVERY_ENABLED_KEY = "automatic_discovery_enabled"
+
+
 @dataclass
 class DesktopServices:
     settings: Settings
     db: Database
     repo: Repository
-    youtube: YouTubeService
-    runner: RunManager
+    youtube: YouTubeService | None
+    runner: RunManager | None
     diagnostics: StartupDiagnostics
     discovery_worker: DiscoveryWorker | None = None
     discovery_loop: DiscoveryLoop | None = None
+    worker_client: Any | None = None
 
 
 def prepare_runtime_storage(settings: Settings) -> None:
@@ -47,25 +52,72 @@ def prepare_runtime_storage(settings: Settings) -> None:
         return
 
 
-def build_services() -> DesktopServices:
-    settings = get_settings()
+def _prepare_repository(settings: Settings, db_path: Path | None = None) -> tuple[Database, Repository]:
     prepare_runtime_storage(settings)
-    db = Database(settings.db_path)
+    db = Database(db_path or settings.db_path)
     db.initialize()
     repo = Repository(db)
     repo.merge_starter_pack(settings.starter_pack_path, version=settings.starter_pack_version)
     repo.import_content_pool(settings.content_pool_path, version=settings.content_pool_version)
     repo.repair_display_metadata_flags()
     repo.recover_scheduler_jobs()
+    return db, repo
+
+
+def _automatic_discovery_enabled(repo: Repository) -> bool:
+    return repo.get_preference(AUTOMATIC_DISCOVERY_ENABLED_KEY) != "0"
+
+
+def build_services(
+    *,
+    settings: Settings | None = None,
+    start_worker: bool = True,
+) -> DesktopServices:
+    settings = settings or get_settings()
+    db, repo = _prepare_repository(settings)
+    diagnostics = StartupDiagnostics(
+        node_ok=True,
+        ytdlp_ok=True,
+        messages=["Busqueda aislada en proceso de trabajo."],
+    )
+    worker_client = None
+    if start_worker:
+        from .worker_client import SearchWorkerProcessClient
+
+        worker_client = SearchWorkerProcessClient(settings=settings, db_path=db.path, autostart=False)
+        worker_client.start()
+    return DesktopServices(
+        settings=settings,
+        db=db,
+        repo=repo,
+        youtube=None,
+        runner=None,
+        diagnostics=diagnostics,
+        worker_client=worker_client,
+    )
+
+
+def build_worker_services(
+    *,
+    settings: Settings | None = None,
+    db_path: Path | None = None,
+    start_discovery_loop: bool = True,
+) -> DesktopServices:
+    settings = settings or get_settings()
+    db, repo = _prepare_repository(settings, db_path=db_path)
+    db.default_profile = "worker_write"
     youtube = YouTubeService(settings)
     diagnostics = youtube.startup_diagnostics()
     runner = RunManager(repo, youtube, settings)
     discovery_worker = DiscoveryWorker(repo, youtube, settings)
-    discovery_loop = DiscoveryLoop(
-        discovery_worker,
-        interval_seconds=int(getattr(settings, "discovery_loop_interval_seconds", 45)),
-    )
-    discovery_loop.start()
+    discovery_loop = None
+    if start_discovery_loop:
+        discovery_loop = DiscoveryLoop(
+            discovery_worker,
+            interval_seconds=int(getattr(settings, "discovery_loop_interval_seconds", 300)),
+            enabled=_automatic_discovery_enabled(repo),
+        )
+        discovery_loop.start()
     return DesktopServices(
         settings=settings,
         db=db,
@@ -80,6 +132,7 @@ def build_services() -> DesktopServices:
 
 class AppController:
     LAST_MAX_CANDIDATES_KEY = "last_max_candidates_per_run"
+    AUTOMATIC_DISCOVERY_ENABLED_KEY = AUTOMATIC_DISCOVERY_ENABLED_KEY
     LEGACY_DEFAULT_MAX_CANDIDATES = 50
 
     def __init__(self, services: DesktopServices) -> None:
@@ -87,6 +140,27 @@ class AppController:
 
     def dashboard_stats(self) -> dict[str, Any]:
         return self.services.repo.dashboard_stats()
+
+    def _worker_call(
+        self,
+        command: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        if self.services.worker_client is None:
+            return None
+        return self.services.worker_client.call(command, payload or {}, timeout=timeout)
+
+    def _require_runner(self) -> RunManager:
+        if self.services.runner is None:
+            raise RuntimeError("El worker de busqueda no esta disponible.")
+        return self.services.runner
+
+    def _require_youtube(self) -> YouTubeService:
+        if self.services.youtube is None:
+            raise RuntimeError("El servicio de YouTube no esta disponible en este proceso.")
+        return self.services.youtube
 
     def list_sources(self) -> list[dict[str, Any]]:
         return self.services.repo.list_sources()
@@ -100,7 +174,7 @@ class AppController:
         max_candidates_per_run: int,
         enabled: bool,
     ) -> int:
-        normalized_value = self.services.youtube.normalize_source_value(source_type, value)
+        normalized_value = YouTubeService.normalize_source_value(source_type, value)
         final_label = self._resolve_source_label(source_type, label, value, normalized_value)
         return self.services.repo.create_source(
             SourceInput(
@@ -117,8 +191,8 @@ class AppController:
         if not cleaned:
             raise ValueError("Escribe un canal o una búsqueda.")
 
-        source_type = self.services.youtube.infer_source_type(cleaned)
-        normalized_value = self.services.youtube.normalize_source_value(source_type, cleaned)
+        source_type = YouTubeService.infer_source_type(cleaned)
+        normalized_value = YouTubeService.normalize_source_value(source_type, cleaned)
         label = self._suggest_source_label(source_type, cleaned, normalized_value)
         max_candidates = self.get_last_max_candidates()
         return self.services.repo.create_source(
@@ -135,8 +209,11 @@ class AppController:
         cleaned = raw_value.strip()
         if not cleaned:
             raise ValueError("Escribe un canal o una busqueda.")
-        source_type = self.services.youtube.infer_source_type(cleaned)
-        normalized_value = self.services.youtube.normalize_source_value(source_type, cleaned)
+        if self.services.worker_client is not None:
+            result = self._worker_call("submit_interest", {"raw_value": cleaned}, timeout=10)
+            return dict(result or {})
+        source_type = YouTubeService.infer_source_type(cleaned)
+        normalized_value = YouTubeService.normalize_source_value(source_type, cleaned)
         label = self._suggest_source_label(source_type, cleaned, normalized_value)
         seed_kind = "user_channel" if source_type == "channel" else "user_search"
         seed_id = self.services.repo.create_discovery_seed(
@@ -161,6 +238,15 @@ class AppController:
         *,
         candidate_limit: int = 150,
     ) -> dict[str, int]:
+        if self.services.worker_client is not None:
+            result = self._worker_call(
+                "run_interest_initial_discovery",
+                {"seed_id": int(seed_id), "candidate_limit": int(candidate_limit)},
+                timeout=None,
+            )
+            if isinstance(result, dict) and isinstance(result.get("summary"), dict):
+                return dict(result["summary"])
+            return dict(result or {})
         if self.services.discovery_worker is None:
             return {}
         summary = self.services.discovery_worker.enqueue_immediate_seed_candidates(
@@ -180,6 +266,18 @@ class AppController:
         max_seed_discoveries: int | None = None,
         max_candidate_inspections: int | None = None,
     ) -> dict[str, int]:
+        if self.services.worker_client is not None:
+            result = self._worker_call(
+                "run_discovery_once",
+                {
+                    "max_seed_discoveries": max_seed_discoveries,
+                    "max_candidate_inspections": max_candidate_inspections,
+                },
+                timeout=None,
+            )
+            if isinstance(result, dict) and isinstance(result.get("summary"), dict):
+                return dict(result["summary"])
+            return dict(result or {})
         if self.services.discovery_worker is None:
             return {}
         return self.services.discovery_worker.run_once(
@@ -188,6 +286,15 @@ class AppController:
         )
 
     def run_manual_feed_expansion(self, *, candidate_limit: int = 200) -> dict[str, int]:
+        if self.services.worker_client is not None:
+            result = self._worker_call(
+                "run_manual_feed",
+                {"candidate_limit": int(candidate_limit)},
+                timeout=None,
+            )
+            if isinstance(result, dict) and isinstance(result.get("summary"), dict):
+                return dict(result["summary"])
+            return dict(result or {})
         if self.services.discovery_worker is None:
             return {}
         return self.services.discovery_worker.run_manual_feed_batch(
@@ -221,7 +328,7 @@ class AppController:
         max_candidates_per_run: int,
         enabled: bool,
     ) -> None:
-        normalized_value = self.services.youtube.normalize_source_value(source_type, value)
+        normalized_value = YouTubeService.normalize_source_value(source_type, value)
         final_label = self._resolve_source_label(source_type, label, value, normalized_value)
         self.services.repo.update_source(
             source_id,
@@ -255,15 +362,27 @@ class AppController:
         self.services.repo.delete_sources(valid_ids, delete_videos=delete_videos)
 
     def run_source(self, source_id: int) -> int:
+        if self.services.worker_client is not None:
+            result = self._worker_call("run_source", {"source_id": int(source_id)}, timeout=10)
+            return int((result or {}).get("run_id")) if isinstance(result, dict) else int(result)
         if not self.services.repo.get_source(source_id):
             raise ValueError("Fuente no encontrada")
-        return self.services.runner.start_run(scope=f"source:{source_id}", source_id=source_id)
+        return self._require_runner().start_run(scope=f"source:{source_id}", source_id=source_id)
 
     def run_all(self) -> int:
-        return self.services.runner.start_run(scope="all")
+        if self.services.worker_client is not None:
+            result = self._worker_call("run_all", {}, timeout=10)
+            return int((result or {}).get("run_id")) if isinstance(result, dict) else int(result)
+        return self._require_runner().start_run(scope="all")
 
     def start_metadata_backfill(self, *, limit: int | None = None) -> int | None:
-        return self.services.runner.start_metadata_backfill(
+        if self.services.worker_client is not None:
+            result = self._worker_call("metadata_backfill", {"limit": limit}, timeout=10)
+            if isinstance(result, dict):
+                run_id = result.get("run_id")
+                return int(run_id) if run_id is not None else None
+            return int(result) if result is not None else None
+        return self._require_runner().start_metadata_backfill(
             limit=limit,
             max_workers=int(getattr(self.services.settings, "metadata_backfill_workers", 1)),
         )
@@ -375,10 +494,12 @@ class AppController:
         return self.services.repo.list_catalog_filters()
 
     def active_run_id(self) -> int | None:
-        return self.services.runner.active_run_id()
+        if self.services.worker_client is not None:
+            return self.services.worker_client.active_run_id()
+        return self._require_runner().active_run_id()
 
     def active_run_snapshot(self) -> dict[str, Any] | None:
-        active_run_id = self.services.runner.active_run_id()
+        active_run_id = self.active_run_id()
         if active_run_id is None:
             return None
         return self.services.repo.get_run(active_run_id)
@@ -398,6 +519,25 @@ class AppController:
     def set_last_max_candidates(self, value: int) -> None:
         safe_value = max(1, min(10000, int(value)))
         self.services.repo.set_preference(self.LAST_MAX_CANDIDATES_KEY, str(safe_value))
+
+    def automatic_discovery_enabled(self) -> bool:
+        return _automatic_discovery_enabled(self.services.repo)
+
+    def set_automatic_discovery_enabled(self, enabled: bool) -> None:
+        safe_enabled = bool(enabled)
+        self.services.repo.set_preference(
+            self.AUTOMATIC_DISCOVERY_ENABLED_KEY,
+            "1" if safe_enabled else "0",
+        )
+        if self.services.worker_client is not None:
+            self.services.worker_client.notify("set_background_enabled", {"enabled": safe_enabled})
+            return
+        if self.services.discovery_loop is not None:
+            self.services.discovery_loop.set_enabled(safe_enabled)
+
+    def pause_background(self, *, seconds: float = 0.5) -> None:
+        if self.services.worker_client is not None:
+            self.services.worker_client.notify("pause_background", {"seconds": float(seconds)})
 
     @classmethod
     def _resolve_source_label(

@@ -109,6 +109,22 @@ class FeedBatchYouTubeService(FakeYouTubeService):
         )
 
 
+class DiverseFeedBatchYouTubeService(FeedBatchYouTubeService):
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en", "es-US"],
+            original_audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title=video_id,
+            channel=f"Feed Channel {video_id}",
+            channel_id=f"feedchan-{video_id}",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
 class MixedSeedYouTubeService(FakeYouTubeService):
     def __init__(self) -> None:
         super().__init__()
@@ -263,7 +279,7 @@ class DiscoveryWorkerTests(unittest.TestCase):
         self.assertIn(("video", "dubbed1"), seeds)
 
     def test_manual_feed_batch_checks_fifty_related_candidates_per_click(self) -> None:
-        youtube = FeedBatchYouTubeService()
+        youtube = DiverseFeedBatchYouTubeService()
         worker = DiscoveryWorker(self.repo, youtube, self.settings)
         self.repo.create_discovery_seed(
             seed_kind="starter_video",
@@ -294,7 +310,7 @@ class DiscoveryWorkerTests(unittest.TestCase):
         db = CountingDatabase(self.settings.db_path)
         db.initialize()
         repo = Repository(db)
-        youtube = FeedBatchYouTubeService()
+        youtube = DiverseFeedBatchYouTubeService()
         worker = DiscoveryWorker(repo, youtube, self.settings)
         repo.create_discovery_seed(
             seed_kind="starter_video",
@@ -309,6 +325,26 @@ class DiscoveryWorkerTests(unittest.TestCase):
 
         self.assertEqual(summary["verified"], 50)
         self.assertLessEqual(db.connect_count, 15)
+
+    def test_verified_seed_priorities_use_batch_channel_counts(self) -> None:
+        db = CountingDatabase(self.settings.db_path)
+        db.initialize()
+        repo = Repository(db)
+        youtube = DiverseFeedBatchYouTubeService()
+        worker = DiscoveryWorker(repo, youtube, self.settings)
+        repo.create_discovery_seed(
+            seed_kind="starter_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=80,
+        )
+        db.connect_count = 0
+
+        summary = worker.run_manual_feed_batch(candidate_limit=50, max_seed_discoveries=1)
+
+        self.assertEqual(summary["verified"], 50)
+        self.assertLessEqual(db.connect_count, 12)
 
     def test_run_once_uses_mixed_content_and_free_seed_pools_without_scoring_candidates(self) -> None:
         youtube = MixedSeedYouTubeService()

@@ -68,7 +68,7 @@ class DiscoveryWorker:
         rejected_video_ids: list[str] = []
         failed_candidates: list[tuple[str, str, int]] = []
         related_seed_payloads: list[dict[str, Any]] = []
-        seed_count_cache: dict[str, int] = {}
+        verified_seed_rows: list[dict[str, Any]] = []
         for candidate in claimed_candidates:
             video_id = str(candidate["video_id"])
             summary["inspected"] += 1
@@ -108,31 +108,33 @@ class DiscoveryWorker:
                 }
             )
             verified_video_ids.append(video_id)
-            channel_id = result.channel_id or candidate.get("channel_id")
-            channel = result.channel or candidate.get("channel")
-            channel_key = self._row_channel_key(
+            verified_seed_rows.append(
                 {
                     "video_id": video_id,
-                    "channel_id": channel_id,
-                    "channel": channel,
-                }
-            )
-            if channel_key in seed_count_cache:
-                same_channel_seed_count = seed_count_cache[channel_key]
-            else:
-                same_channel_seed_count = self.repo.count_video_discovery_seeds_for_channel(channel_id, channel)
-            seed_priority = 80 + min(50, same_channel_seed_count * 2)
-            seed_count_cache[channel_key] = same_channel_seed_count + 1
-            related_seed_payloads.append(
-                {
-                    "seed_kind": "related_video",
-                    "source_type": "video",
-                    "label": result.title or str(candidate.get("title") or video_id),
+                    "title": result.title or str(candidate.get("title") or video_id),
+                    "channel_id": result.channel_id or candidate.get("channel_id"),
+                    "channel": result.channel or candidate.get("channel"),
                     "value": video_id,
-                    "priority": min(130, seed_priority),
                 }
             )
             summary["verified"] += 1
+
+        if verified_seed_rows:
+            seed_count_cache = self.repo.count_video_discovery_seeds_by_channel_keys(verified_seed_rows)
+            for seed_row in verified_seed_rows:
+                channel_key = self._row_channel_key(seed_row)
+                same_channel_seed_count = seed_count_cache.get(channel_key, 0)
+                seed_count_cache[channel_key] = same_channel_seed_count + 1
+                seed_priority = 80 + min(50, same_channel_seed_count * 2)
+                related_seed_payloads.append(
+                    {
+                        "seed_kind": "related_video",
+                        "source_type": "video",
+                        "label": str(seed_row.get("title") or seed_row["video_id"]),
+                        "value": str(seed_row["video_id"]),
+                        "priority": min(130, seed_priority),
+                    }
+                )
 
         if result_payloads:
             self.repo.store_inspection_results_batch(result_payloads)
@@ -262,11 +264,16 @@ class DiscoveryWorker:
 
 
 class DiscoveryLoop:
-    def __init__(self, worker: DiscoveryWorker, *, interval_seconds: int = 45) -> None:
+    def __init__(self, worker: DiscoveryWorker, *, interval_seconds: int = 300, enabled: bool = True) -> None:
         self.worker = worker
         self.interval_seconds = max(5, int(interval_seconds))
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._enabled = threading.Event()
+        if enabled:
+            self._enabled.set()
+        self._pause_lock = threading.Lock()
+        self._paused_until = 0.0
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -282,10 +289,41 @@ class DiscoveryLoop:
     def wake(self) -> None:
         self._wake.set()
 
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._enabled.set()
+        else:
+            self._enabled.clear()
+        self._wake.set()
+
+    def is_enabled(self) -> bool:
+        return self._enabled.is_set()
+
+    def pause_for(self, seconds: float) -> None:
+        until = time.monotonic() + max(0.05, float(seconds))
+        with self._pause_lock:
+            self._paused_until = max(self._paused_until, until)
+
+    def resume(self) -> None:
+        with self._pause_lock:
+            self._paused_until = 0.0
+        self._wake.set()
+
+    def _pause_remaining(self) -> float:
+        with self._pause_lock:
+            return max(0.0, self._paused_until - time.monotonic())
+
     def _run(self) -> None:
         self._wake.wait(3)
         while not self._stop.is_set():
             self._wake.clear()
+            if not self._enabled.is_set():
+                self._wake.wait(self.interval_seconds)
+                continue
+            remaining = self._pause_remaining()
+            if remaining > 0:
+                self._wake.wait(min(self.interval_seconds, remaining))
+                continue
             try:
                 self.worker.run_once()
             except Exception:

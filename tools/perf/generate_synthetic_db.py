@@ -114,7 +114,19 @@ def build(
             search_batch.append((index + 1, video_id, title, channel))
             for lang in languages:
                 base = lang.split("-", 1)[0].lower()
-                track_batch.append((video_id, lang, base, "", 1 if dub_kind == "automatic" else 0, "synthetic"))
+                is_spanish = 1 if base == "es" else 0
+                is_original = 0 if is_spanish and has_dubbing else 1 if lang == languages[0] else 0
+                track_batch.append(
+                    (
+                        video_id,
+                        lang,
+                        base,
+                        "",
+                        1 if dub_kind == "automatic" and is_spanish else 0,
+                        is_original,
+                        "synthetic",
+                    )
+                )
 
             if len(video_batch) >= safe_chunk_size:
                 flush(conn, video_batch, source_batch, track_batch, search_batch)
@@ -197,8 +209,10 @@ def flush(
     )
     conn.executemany(
         """
-        INSERT INTO video_audio_tracks(video_id, language_code, language_base, track_id, is_auto_dubbed, evidence_source)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO video_audio_tracks(
+            video_id, language_code, language_base, track_id, is_auto_dubbed, is_original_audio, evidence_source
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?)
         """,
         tracks,
     )

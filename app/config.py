@@ -28,7 +28,7 @@ class Settings:
     discovery_seed_batch: int = 2
     discovery_inspect_batch: int = 12
     discovery_seed_candidate_limit: int = 50
-    discovery_loop_interval_seconds: int = 45
+    discovery_loop_interval_seconds: int = 300
     starter_pack_version: str = "v3"
     content_pool_version: str = "v2"
     update_manifest_url: str = ""

@@ -9,10 +9,10 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, QSize, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QPoint, QPointF, QObject, QSize, Qt, Signal
+from PySide6.QtGui import QPixmap, QWheelEvent
 from PySide6.QtNetwork import QNetworkReply
-from PySide6.QtWidgets import QApplication, QLabel, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QWidget
 
 from app import ui as ui_module
 from app.config import Settings
@@ -240,6 +240,17 @@ class CatalogUiTests(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "total_videos_card"))
         self.assertFalse(hasattr(self.window, "sources_count_card"))
 
+    def test_topbar_has_automatic_search_toggle(self) -> None:
+        toggles = [
+            checkbox
+            for checkbox in self.window.findChildren(QCheckBox)
+            if checkbox.text() == "Búsqueda Automática"
+        ]
+
+        self.assertEqual(len(toggles), 1)
+        self.assertIs(toggles[0], self.window.automatic_discovery_toggle)
+        self.assertTrue(toggles[0].isChecked())
+
     def test_catalog_shows_essential_controls_and_collapsed_filters(self) -> None:
         self.window.resize(1600, 1000)
         self.window.switch_page("catalog")
@@ -251,6 +262,11 @@ class CatalogUiTests(unittest.TestCase):
         self.assertTrue(self.window.catalog_controls_shell.isVisible())
         self.assertFalse(self.window.catalog_filters_panel.isVisible())
         self.assertEqual(self.window.catalog_filters_toggle.text(), "Mas filtros")
+        self.assertIsInstance(self.window.catalog_lang, ui_module.CatalogFilterComboBox)
+        self.assertIsInstance(self.window.catalog_sort, ui_module.CatalogFilterComboBox)
+        self.assertEqual(self.window.catalog_lang.display_text(), "Idioma: Español")
+        self.assertEqual(self.window.catalog_sort.display_text(), "Ordenar por: Más recientes")
+        self.assertEqual(self.window.catalog_sort.currentText(), "Más recientes")
         self.assertEqual(self.window.catalog_model.rowCount(), 1)
         self.assertEqual(self.window.catalog_results_count.text(), "1 encontrados")
         self.assertTrue(self.window.catalog_visibility.currentData())
@@ -271,6 +287,19 @@ class CatalogUiTests(unittest.TestCase):
         self.assertEqual(self.window.catalog_sort.currentData(), "recent")
         self.assertGreaterEqual(self.window.catalog_sort.findData("random"), 0)
         self.assertFalse(self.window.catalog_empty_stack.isVisible())
+
+    def test_secondary_catalog_filters_use_dropdown_controls(self) -> None:
+        combos = (
+            self.window.catalog_channel,
+            self.window.catalog_source,
+            self.window.catalog_visibility,
+            self.window.catalog_dub_kind,
+            self.window.catalog_year,
+            self.window.catalog_after_year,
+            self.window.catalog_before_year,
+        )
+
+        self.assertTrue(all(isinstance(combo, ui_module.CatalogFilterComboBox) for combo in combos))
 
     def test_catalog_filter_panel_hides_source_search_section(self) -> None:
         self.window.switch_page("catalog")
@@ -399,8 +428,105 @@ class CatalogUiTests(unittest.TestCase):
         service.shutdown()
         self.assertEqual(fake_executor.shutdown_kwargs, {"wait": False, "cancel_futures": True})
 
-    def test_thumbnail_render_scale_keeps_cards_clearer_than_half_resolution(self) -> None:
-        self.assertEqual(THUMBNAIL_RENDER_SCALE, 0.75)
+    def test_thumbnail_render_scale_uses_full_card_resolution(self) -> None:
+        self.assertEqual(THUMBNAIL_RENDER_SCALE, 1.0)
+
+    def test_youtube_thumbnail_candidates_add_stable_fallbacks(self) -> None:
+        stale_url = "https://i.ytimg.com/vi/ueSrDmm5X5Y/hq720_custom_2.jpg?expired=1"
+
+        candidates = ui_module.youtube_thumbnail_candidates("ueSrDmm5X5Y", stale_url)
+
+        self.assertEqual(candidates[0], stale_url)
+        self.assertIn("https://i.ytimg.com/vi/ueSrDmm5X5Y/hq720.jpg", candidates)
+        self.assertIn("https://i.ytimg.com/vi/ueSrDmm5X5Y/hqdefault.jpg", candidates)
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+    def test_thumbnail_service_tries_next_fallback_when_request_fails(self) -> None:
+        class FakeReply(QObject):
+            finished = Signal()
+
+            def __init__(self, error: QNetworkReply.NetworkError) -> None:
+                super().__init__()
+                self._error = error
+                self.deleted = False
+
+            def error(self) -> QNetworkReply.NetworkError:
+                return self._error
+
+            def readAll(self) -> bytes:
+                return b""
+
+            def deleteLater(self) -> None:
+                self.deleted = True
+
+        class FakeManager:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+                self.replies: list[FakeReply] = []
+
+            def get(self, request: object) -> FakeReply:
+                url_getter = getattr(request, "url")
+                self.urls.append(url_getter().toString())
+                error = (
+                    QNetworkReply.NetworkError.ContentNotFoundError
+                    if len(self.urls) == 1
+                    else QNetworkReply.NetworkError.NoError
+                )
+                reply = FakeReply(error)
+                self.replies.append(reply)
+                return reply
+
+        owner = QWidget()
+        service = ThumbnailService(owner, Path(self.temp_dir.name) / "thumbs")
+        fake_manager = FakeManager()
+        service.manager = fake_manager  # type: ignore[assignment]
+
+        service.request_with_fallbacks(
+            ["https://example.test/stale.jpg", "https://example.test/stable.jpg"],
+            QSize(96, 54),
+            lambda _pixmap: None,
+        )
+        fake_manager.replies[0].finished.emit()
+        for _ in range(20):
+            self.app.processEvents()
+            if len(fake_manager.urls) >= 2:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(fake_manager.urls, ["https://example.test/stale.jpg", "https://example.test/stable.jpg"])
+        self.assertTrue(fake_manager.replies[0].deleted)
+        service.shutdown()
+
+    def test_catalog_card_height_is_compact_without_changing_thumbnail_ratio(self) -> None:
+        delegate = ui_module.CatalogCardDelegate()
+
+        delegate.configure(300, "Medio")
+
+        self.assertEqual(delegate.thumbnail_height(), round(300 * 9 / 16))
+        self.assertLessEqual(delegate.card_height - delegate.thumbnail_height(), 106)
+        self.assertLess(delegate.card_height, 280)
+
+    def test_catalog_wheel_scroll_uses_small_pixel_steps(self) -> None:
+        delegate = ui_module.CatalogCardDelegate()
+        view = ui_module.CatalogListView(delegate)
+        bar = view.verticalScrollBar()
+        bar.setRange(0, 1000)
+        bar.setValue(500)
+
+        event = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        view.wheelEvent(event)
+
+        self.assertEqual(bar.value(), 572)
+        self.assertTrue(event.isAccepted())
 
     def test_thumbnail_service_caps_active_network_requests(self) -> None:
         class FakeReply(QObject):
@@ -434,6 +560,28 @@ class CatalogUiTests(unittest.TestCase):
         self.assertLessEqual(getattr(service, "active_request_count")(), 6)
         service.shutdown()
 
+    def test_thumbnail_shutdown_aborts_active_replies(self) -> None:
+        class FakeReply:
+            def __init__(self) -> None:
+                self.aborted = False
+                self.deleted = False
+
+            def abort(self) -> None:
+                self.aborted = True
+
+            def deleteLater(self) -> None:
+                self.deleted = True
+
+        owner = QWidget()
+        service = ThumbnailService(owner, Path(self.temp_dir.name) / "thumbs")
+        reply = FakeReply()
+        service._active_replies[("https://example.test/thumb.jpg", 96, 54)] = reply  # type: ignore[assignment]
+
+        service.shutdown()
+
+        self.assertTrue(reply.aborted)
+        self.assertTrue(reply.deleted)
+
     def test_model_batches_thumbnail_updates_into_contiguous_ranges(self) -> None:
         model = ui_module.CatalogListModel()
         model.set_items(
@@ -452,6 +600,19 @@ class CatalogUiTests(unittest.TestCase):
         model.set_thumbnails_batch({"one": pixmap, "two": pixmap})
 
         self.assertEqual(emissions, [(0, 1), (3, 3)])
+
+    def test_model_can_attach_fallback_thumbnail_url_to_empty_item(self) -> None:
+        model = ui_module.CatalogListModel()
+        model.set_items([{"video_id": "missing-url", "thumbnail_url": ""}])
+        pixmap = QPixmap(4, 4)
+        pixmap.fill()
+
+        model.set_thumbnail_url(0, "https://i.ytimg.com/vi/missing-url/hq720.jpg")
+        model.set_thumbnails_batch({"https://i.ytimg.com/vi/missing-url/hq720.jpg": pixmap})
+
+        loaded = model.data(model.index(0, 0), ui_module.CATALOG_PIXMAP_ROLE)
+        self.assertIsInstance(loaded, QPixmap)
+        self.assertFalse(loaded.isNull())
 
     def test_stale_catalog_thumbnails_do_not_emit_model_changes(self) -> None:
         self.window.catalog_model.set_items(
@@ -638,6 +799,395 @@ class CatalogUiTests(unittest.TestCase):
             self.assertEqual(self.window.catalog_model.rowCount(), 4)
             self.assertEqual(self.window.catalog_results_count.text(), "6 encontrados")
             self.assertFalse(self.window._catalog_count_pending)
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_append_keeps_scroll_position_across_rerender(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 20
+        try:
+            for index in range(60):
+                video_id = f"scroll-page-{index:02d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Scroll page video {index}",
+                        channel="Scroll Channel",
+                        channel_id="scroll-channel",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-04-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(max(1, bar.maximum() - 20))
+            self.app.processEvents()
+            before_append = bar.value()
+
+            self.window.load_next_catalog_page()
+            wait_for_catalog_idle(self.window, self.app)
+            after_append = bar.value()
+            self.window.render_catalog_cards()
+            self.app.processEvents()
+
+            self.assertGreater(before_append, 0)
+            self.assertGreaterEqual(after_append, before_append - 1)
+            self.assertGreaterEqual(bar.value(), before_append - 1)
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_rerender_with_same_rows_does_not_reset_model(self) -> None:
+        self.window.switch_page("catalog")
+        self.window.show()
+        self.app.processEvents()
+        self.window.refresh_catalog()
+        wait_for_catalog_idle(self.window, self.app)
+
+        resets: list[bool] = []
+        self.window.catalog_model.modelReset.connect(lambda: resets.append(True))
+
+        self.window.render_catalog_cards()
+        self.app.processEvents()
+
+        self.assertEqual(resets, [])
+
+    def test_catalog_near_bottom_append_does_not_jump_to_top(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 20
+        try:
+            for index in range(60):
+                video_id = f"near-bottom-{index:02d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Near bottom video {index}",
+                        channel="Near Bottom",
+                        channel_id="near-bottom",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-02-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            wait_for_catalog_idle(self.window, self.app)
+            self.app.processEvents()
+
+            self.assertGreater(bar.maximum(), 0)
+            self.assertEqual(self.window.catalog_model.rowCount(), 40)
+            self.assertEqual(bar.value(), bar.maximum())
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_large_append_stays_at_bottom_after_batched_layout_settles(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 80
+        try:
+            for index in range(220):
+                video_id = f"batched-bottom-{index:03d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Batched bottom video {index}",
+                        channel="Batched Bottom",
+                        channel_id="batched-bottom",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-05-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+            for _ in range(20):
+                self.app.processEvents()
+                time.sleep(0.001)
+
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            self.app.processEvents()
+
+            self.window.load_next_catalog_page()
+            wait_for_catalog_idle(self.window, self.app)
+            for _ in range(40):
+                self.app.processEvents()
+                time.sleep(0.001)
+
+            self.assertGreaterEqual(self.window.catalog_model.rowCount(), 160)
+            self.assertGreater(bar.maximum(), 0)
+            self.assertEqual(bar.value(), bar.maximum())
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_same_filter_refresh_keeps_scroll_position(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 80
+        try:
+            for index in range(60):
+                video_id = f"refresh-scroll-{index:02d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Refresh scroll video {index}",
+                        channel="Refresh Scroll",
+                        channel_id="refresh-scroll",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-03-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(max(1, bar.maximum() // 2))
+            self.app.processEvents()
+            before_refresh = bar.value()
+
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+
+            self.assertGreater(before_refresh, 0)
+            self.assertGreaterEqual(bar.value(), before_refresh - 1)
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_same_filter_refresh_keeps_loaded_pages(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 20
+        try:
+            for index in range(60):
+                video_id = f"loaded-refresh-{index:02d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Loaded refresh video {index}",
+                        channel="Loaded Refresh",
+                        channel_id="loaded-refresh",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-01-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+            self.window.load_next_catalog_page()
+            wait_for_catalog_idle(self.window, self.app)
+
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(max(1, bar.maximum() // 2))
+            self.app.processEvents()
+            before_refresh = bar.value()
+
+            self.assertEqual(self.window.catalog_model.rowCount(), 40)
+
+            calls: list[dict[str, object]] = []
+
+            def fake_start_catalog_page_worker(generation: int, filters: dict[str, object], **kwargs: object) -> None:
+                calls.append(
+                    {
+                        "generation": generation,
+                        "filters": dict(filters),
+                        "cursor": kwargs.get("cursor"),
+                        "append": kwargs.get("append"),
+                        "page_size": kwargs.get("page_size"),
+                    }
+                )
+
+            self.window.start_catalog_page_worker = fake_start_catalog_page_worker  # type: ignore[method-assign]
+            self.window.refresh_catalog()
+
+            self.assertEqual(self.window.catalog_model.rowCount(), 40)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(calls[0]["append"])
+            self.assertEqual(calls[0]["page_size"], 40)
+            self.assertGreaterEqual(bar.value(), before_refresh - 1)
+        finally:
+            ui_module.CATALOG_PAGE_SIZE = original_page_size
+
+    def test_catalog_same_filter_refresh_waits_for_pending_append(self) -> None:
+        original_page_size = ui_module.CATALOG_PAGE_SIZE
+        ui_module.CATALOG_PAGE_SIZE = 20
+        try:
+            for index in range(60):
+                video_id = f"append-refresh-{index:02d}"
+                self.repo.upsert_candidate(
+                    CandidateVideo(
+                        video_id=video_id,
+                        title=f"Append refresh video {index}",
+                        channel="Append Refresh",
+                        channel_id="append-refresh",
+                        duration_seconds=90 + index,
+                        thumbnail_url="",
+                        source_id=self.source_id,
+                        discovered_at=to_iso(),
+                    )
+                )
+                self.repo.store_inspection_result(
+                    video_id,
+                    audio_languages=["en", "es-US"],
+                    has_dubbing=True,
+                    dub_evidence={
+                        "source": "inspection",
+                        "original_audio_languages": ["en"],
+                        "auto_dubbed_languages": [],
+                    },
+                    published_at=f"2026-01-{(index % 28) + 1:02d}",
+                    view_count=1000 + index,
+                )
+
+            self.window.resize(900, 500)
+            self.window.switch_page("catalog")
+            self.window.show()
+            self.app.processEvents()
+            self.window.refresh_catalog()
+            wait_for_catalog_idle(self.window, self.app)
+
+            calls: list[dict[str, object]] = []
+
+            def fake_start_catalog_page_worker(generation: int, filters: dict[str, object], **kwargs: object) -> None:
+                calls.append(
+                    {
+                        "generation": generation,
+                        "filters": dict(filters),
+                        "cursor": kwargs.get("cursor"),
+                        "append": kwargs.get("append"),
+                        "page_size": kwargs.get("page_size"),
+                    }
+                )
+
+            self.window.start_catalog_page_worker = fake_start_catalog_page_worker  # type: ignore[method-assign]
+            bar = self.window.catalog_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+            self.app.processEvents()
+
+            self.window.load_next_catalog_page()
+            append_generation = self.window._catalog_query_generation
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0]["append"])
+
+            self.window.refresh_catalog()
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(self.window._catalog_query_generation, append_generation)
+
+            page = self.window.controller.list_catalog_page(
+                lang=calls[0]["filters"].get("lang"),
+                source_id=calls[0]["filters"].get("source_id"),
+                channel=calls[0]["filters"].get("channel"),
+                query=calls[0]["filters"].get("query"),
+                only_dubbed=bool(calls[0]["filters"].get("only_dubbed")),
+                only_favorites=bool(calls[0]["filters"].get("only_favorites")),
+                dub_kind=str(calls[0]["filters"].get("dub_kind") or ""),
+                sort_by=str(calls[0]["filters"].get("sort_by") or "recent"),
+                year=calls[0]["filters"].get("year"),
+                year_after=calls[0]["filters"].get("year_after"),
+                year_before=calls[0]["filters"].get("year_before"),
+                page_size=ui_module.CATALOG_PAGE_SIZE,
+                cursor=str(calls[0]["cursor"]),
+            )
+            self.window.handle_catalog_page_ready(append_generation, page, True)
+            self.app.processEvents()
+
+            self.assertEqual(self.window.catalog_model.rowCount(), 40)
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(calls[1]["append"])
+            self.assertEqual(calls[1]["page_size"], 40)
         finally:
             ui_module.CATALOG_PAGE_SIZE = original_page_size
 

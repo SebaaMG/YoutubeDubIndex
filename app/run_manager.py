@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Callable
 
 from .config import Settings
 from .repository import CandidateVideo, Repository, to_iso, utc_now
@@ -18,6 +18,7 @@ class RunManager:
         self._lock = threading.Lock()
         self._active_run_id: int | None = None
         self._active_thread: threading.Thread | None = None
+        self._event_callback: Callable[[dict[str, Any]], None] | None = None
 
     def is_active(self) -> bool:
         with self._lock:
@@ -26,6 +27,18 @@ class RunManager:
     def active_run_id(self) -> int | None:
         with self._lock:
             return self._active_run_id
+
+    def set_event_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        self._event_callback = callback
+
+    def _emit_event(self, payload: dict[str, Any]) -> None:
+        callback = self._event_callback
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            pass
 
     def start_run(self, *, scope: str, source_id: int | None = None) -> int:
         with self._lock:
@@ -49,6 +62,7 @@ class RunManager:
             self._active_run_id = run_id
             self._active_thread = thread
             thread.start()
+            self._emit_event({"event": "run_started", "run_id": run_id})
             return run_id
 
     @property
@@ -60,8 +74,10 @@ class RunManager:
             self.repo.mark_run_running(run_id)
             warning = self._execute(run_id, source_id)
             self.repo.finish_run(run_id, status="completed", error=warning)
+            self._emit_event({"event": "run_finished", "run_id": run_id, "status": "completed"})
         except Exception as exc:
             self.repo.finish_run(run_id, status="failed", error=str(exc)[:500])
+            self._emit_event({"event": "run_finished", "run_id": run_id, "status": "failed", "error": str(exc)[:500]})
         finally:
             with self._lock:
                 self._active_run_id = None
@@ -155,6 +171,7 @@ class RunManager:
             self._active_run_id = run_id
             self._active_thread = thread
             thread.start()
+            self._emit_event({"event": "run_started", "run_id": run_id})
             return run_id
 
     def _metadata_backfill_wrapper(self, run_id: int, video_ids: set[str], max_workers: int | None) -> None:
@@ -163,8 +180,10 @@ class RunManager:
             self.repo.increment_run_metrics(run_id, candidates_found=len(video_ids))
             self._inspect_video_ids(run_id, video_ids, max_workers=max_workers)
             self.repo.finish_run(run_id, status="completed")
+            self._emit_event({"event": "run_finished", "run_id": run_id, "status": "completed"})
         except Exception as exc:
             self.repo.finish_run(run_id, status="failed", error=str(exc)[:500])
+            self._emit_event({"event": "run_finished", "run_id": run_id, "status": "failed", "error": str(exc)[:500]})
         finally:
             with self._lock:
                 self._active_run_id = None
@@ -219,6 +238,14 @@ class RunManager:
                     run_id,
                     videos_checked=len(result_payloads) + len(failures),
                     dubbed_found=dubbed_found,
+                )
+                self._emit_event(
+                    {
+                        "event": "run_progress",
+                        "run_id": run_id,
+                        "videos_checked": len(result_payloads) + len(failures),
+                        "dubbed_found": dubbed_found,
+                    }
                 )
 
     def _inspect_with_retry(self, video_id: str) -> InspectionResult:
