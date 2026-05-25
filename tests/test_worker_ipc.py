@@ -104,7 +104,7 @@ class WorkerIpcTests(unittest.TestCase):
         self.assertTrue(loop.resumed)
         self.assertEqual(loop.enabled_values, [False, True])
         self.assertTrue(loop.stopped)
-        self.assertIn({"event": "run_started", "run_id": 55}, emitted)
+        self.assertIn({"event": "run_started", "run_id": 55, "scope": "source:5"}, emitted)
         self.assertIn("PASSIVE", db.checkpoints)
 
     def test_client_tracks_active_run_from_worker_events(self) -> None:

@@ -62,7 +62,7 @@ class RunManager:
             self._active_run_id = run_id
             self._active_thread = thread
             thread.start()
-            self._emit_event({"event": "run_started", "run_id": run_id})
+            self._emit_event({"event": "run_started", "run_id": run_id, "scope": scope})
             return run_id
 
     @property
@@ -178,13 +178,23 @@ class RunManager:
             self._active_run_id = run_id
             self._active_thread = thread
             thread.start()
-            self._emit_event({"event": "run_started", "run_id": run_id})
+            self._emit_event({"event": "run_started", "run_id": run_id, "scope": "metadata"})
             return run_id
 
     def _metadata_backfill_wrapper(self, run_id: int, video_ids: set[str], max_workers: int | None) -> None:
         try:
             self.repo.mark_run_running(run_id)
             self.repo.increment_run_metrics(run_id, candidates_found=len(video_ids))
+            self._emit_event(
+                {
+                    "event": "run_progress",
+                    "run_id": run_id,
+                    "scope": "metadata",
+                    "videos_checked": 0,
+                    "dubbed_found": 0,
+                    "candidates_found": len(video_ids),
+                }
+            )
             self._inspect_video_ids(run_id, video_ids, max_workers=max_workers)
             self.repo.finish_run(run_id, status="completed")
             self._emit_event({"event": "run_finished", "run_id": run_id, "status": "completed"})
@@ -198,8 +208,10 @@ class RunManager:
 
     def _inspect_video_ids(self, run_id: int, video_ids: set[str], max_workers: int | None = None) -> None:
         worker_count = int(max_workers or self.settings.inspect_workers)
-        batch_size = max(10, int(getattr(self.settings, "inspect_batch_size", 200)))
+        batch_size = max(10, int(getattr(self.settings, "inspect_batch_size", 50)))
         sorted_ids = sorted(video_ids)
+        total_checked = 0
+        total_dubbed = 0
         with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
             for start in range(0, len(sorted_ids), batch_size):
                 batch_ids = sorted_ids[start : start + batch_size]
@@ -246,12 +258,15 @@ class RunManager:
                     videos_checked=len(result_payloads) + len(failures),
                     dubbed_found=dubbed_found,
                 )
+                total_checked += len(result_payloads) + len(failures)
+                total_dubbed += dubbed_found
                 self._emit_event(
                     {
                         "event": "run_progress",
                         "run_id": run_id,
-                        "videos_checked": len(result_payloads) + len(failures),
-                        "dubbed_found": dubbed_found,
+                        "videos_checked": total_checked,
+                        "dubbed_found": total_dubbed,
+                        "candidates_found": len(sorted_ids),
                     }
                 )
 

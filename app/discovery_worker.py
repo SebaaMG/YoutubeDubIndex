@@ -3,7 +3,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable
 
 from .config import Settings
 from .repository import Repository
@@ -15,6 +16,20 @@ class DiscoveryWorker:
         self.repo = repo
         self.youtube = youtube
         self.settings = settings
+        self._run_lock = threading.Lock()
+        self._event_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_event_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        self._event_callback = callback
+
+    def _emit_event(self, payload: dict[str, Any]) -> None:
+        callback = self._event_callback
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            pass
 
     def run_once(
         self,
@@ -24,9 +39,35 @@ class DiscoveryWorker:
         randomize_seeds: bool = False,
         seed_rescan_delay_minutes: int = 240,
     ) -> dict[str, int]:
-        seed_limit = int(max_seed_discoveries or getattr(self.settings, "discovery_seed_batch", 2))
-        inspect_limit = int(max_candidate_inspections or getattr(self.settings, "discovery_inspect_batch", 12))
+        with self._run_lock:
+            return self._run_once_unlocked(
+                max_seed_discoveries=max_seed_discoveries,
+                max_candidate_inspections=max_candidate_inspections,
+                randomize_seeds=randomize_seeds,
+                seed_rescan_delay_minutes=seed_rescan_delay_minutes,
+            )
+
+    def _run_once_unlocked(
+        self,
+        *,
+        max_seed_discoveries: int | None = None,
+        max_candidate_inspections: int | None = None,
+        randomize_seeds: bool = False,
+        seed_rescan_delay_minutes: int = 240,
+    ) -> dict[str, int]:
+        configured_seed_batch = max(1, min(50, int(getattr(self.settings, "discovery_seed_batch", 25))))
+        inspect_limit = int(
+            getattr(self.settings, "discovery_inspect_batch", 250)
+            if max_candidate_inspections is None
+            else max_candidate_inspections
+        )
+        seed_budget = (
+            max(configured_seed_batch, max(0, inspect_limit))
+            if max_seed_discoveries is None
+            else max(0, int(max_seed_discoveries))
+        )
         summary = {
+            "target": inspect_limit,
             "seeds": 0,
             "related_candidates": 0,
             "inspected": 0,
@@ -40,43 +81,93 @@ class DiscoveryWorker:
             "seed_top_channel_count": 0,
         }
 
-        claimed_seeds = self.repo.claim_discovery_seeds_mixed(limit=seed_limit, randomize=randomize_seeds)
-        self._apply_seed_metrics(summary, claimed_seeds)
-        for seed in claimed_seeds:
-            summary["seeds"] += 1
-            try:
-                candidates = self._discover_seed(seed)
-            except Exception as exc:
-                self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=60)
-                summary["failed"] += 1
+        claimed_seeds: list[dict[str, Any]] = []
+        claimed_candidates: list[dict[str, Any]] = []
+        remaining = max(0, inspect_limit)
+        chunk_size = max(1, min(50, int(getattr(self.settings, "discovery_inspection_chunk_size", 50))))
+        while remaining > 0:
+            chunk = self.repo.claim_frontier_candidates(limit=min(chunk_size, remaining))
+            if chunk:
+                claimed_candidates.extend(chunk)
+                self._process_candidate_chunk(chunk, summary)
+                remaining -= len(chunk)
                 continue
-            if candidates:
-                self.repo.enqueue_candidates_batch(
-                    candidates,
-                    source_seed_id=int(seed["id"]),
-                    discovered_from_video_id=str(seed["value"]) if seed["source_type"] == "video" else None,
-                    priority=max(1, int(seed["priority"] or 100) + 10),
-                    score=1.0,
-                )
-            summary["related_candidates"] += len(candidates)
-            self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=seed_rescan_delay_minutes)
 
-        claimed_candidates = self.repo.claim_frontier_candidates(limit=inspect_limit)
+            if seed_budget <= 0:
+                break
+            seed_batch = self.repo.claim_discovery_seeds_mixed(
+                limit=min(configured_seed_batch, seed_budget),
+                randomize=randomize_seeds,
+            )
+            if not seed_batch:
+                break
+            seed_budget -= len(seed_batch)
+            claimed_seeds.extend(seed_batch)
+            for seed in seed_batch:
+                summary["seeds"] += 1
+                try:
+                    candidates = self._discover_seed(seed)
+                except Exception:
+                    self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=60)
+                    summary["failed"] += 1
+                    continue
+                if candidates:
+                    self.repo.enqueue_candidates_batch(
+                        candidates,
+                        source_seed_id=int(seed["id"]),
+                        discovered_from_video_id=str(seed["value"]) if seed["source_type"] == "video" else None,
+                        priority=max(1, int(seed["priority"] or 100) + 10),
+                        score=1.0,
+                    )
+                summary["related_candidates"] += len(candidates)
+                self.repo.mark_discovery_seed_scanned(int(seed["id"]), delay_minutes=seed_rescan_delay_minutes)
+
+        self._apply_seed_metrics(summary, claimed_seeds)
         self._apply_candidate_metrics(summary, claimed_candidates)
+        if summary["inspected"] or summary["related_candidates"]:
+            self._emit_event({"event": "summary_dirty", "summary": dict(summary)})
+        if summary["inspected"]:
+            self._emit_discovery_progress(summary, active=False)
+        return summary
+
+    def _emit_discovery_progress(self, summary: dict[str, int | float], *, active: bool = True) -> None:
+        target = int(summary.get("target") or 0)
+        inspected = int(summary.get("inspected") or 0)
+        self._emit_event(
+            {
+                "event": "discovery_progress" if active else "discovery_finished",
+                "scope": "exploración",
+                "active": active,
+                "target": max(target, inspected, 1),
+                "inspected": inspected,
+                "verified": int(summary.get("verified") or 0),
+                "rejected": int(summary.get("rejected") or 0),
+                "failed": int(summary.get("failed") or 0),
+            }
+        )
+
+    def _process_candidate_chunk(
+        self,
+        claimed_candidates: list[dict[str, Any]],
+        summary: dict[str, int | float],
+    ) -> None:
         result_payloads: list[dict[str, Any]] = []
         verified_video_ids: list[str] = []
         rejected_video_ids: list[str] = []
         failed_candidates: list[tuple[str, str, int]] = []
         related_seed_payloads: list[dict[str, Any]] = []
         verified_seed_rows: list[dict[str, Any]] = []
-        for candidate in claimed_candidates:
+        inspected_results = self._inspect_candidates(claimed_candidates)
+        for candidate, result, error in inspected_results:
             video_id = str(candidate["video_id"])
             summary["inspected"] += 1
-            try:
-                result = self.youtube.inspect_video(video_id)
-            except Exception as exc:
+            if error is not None:
                 attempts = int(candidate.get("attempts") or 0)
-                failed_candidates.append((video_id, str(exc), min(24 * 60, 30 * (attempts + 1))))
+                failed_candidates.append((video_id, str(error), min(24 * 60, 30 * (attempts + 1))))
+                summary["failed"] += 1
+                continue
+            if result is None:
+                failed_candidates.append((video_id, "La inspeccion no devolvio resultado.", 30))
                 summary["failed"] += 1
                 continue
 
@@ -146,8 +237,61 @@ class DiscoveryWorker:
             self.repo.mark_candidates_rejected(rejected_video_ids, "no dubbing")
         if failed_candidates:
             self.repo.mark_candidates_failed(failed_candidates)
+        if verified_video_ids:
+            self._emit_event(
+                {
+                    "event": "catalog_changed",
+                    "verified": len(verified_video_ids),
+                    "inspected": len(claimed_candidates),
+                    "summary": dict(summary),
+                }
+            )
+        elif claimed_candidates:
+            self._emit_event(
+                {
+                    "event": "summary_dirty",
+                    "inspected": len(claimed_candidates),
+                    "summary": dict(summary),
+                }
+            )
+        if claimed_candidates:
+            self._emit_discovery_progress(summary, active=True)
 
-        return summary
+    def _inspect_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], Any | None, Exception | None]]:
+        if not candidates:
+            return []
+        worker_count = max(
+            1,
+            min(
+                len(candidates),
+                int(getattr(self.settings, "discovery_inspect_workers", getattr(self.settings, "inspect_workers", 4))),
+            ),
+        )
+        if worker_count <= 1:
+            results: list[tuple[dict[str, Any], Any | None, Exception | None]] = []
+            for candidate in candidates:
+                try:
+                    results.append((candidate, self.youtube.inspect_video(str(candidate["video_id"])), None))
+                except Exception as exc:
+                    results.append((candidate, None, exc))
+            return results
+
+        results = []
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="discovery-inspect") as executor:
+            future_map = {
+                executor.submit(self.youtube.inspect_video, str(candidate["video_id"])): candidate
+                for candidate in candidates
+            }
+            for future in as_completed(future_map):
+                candidate = future_map[future]
+                try:
+                    results.append((candidate, future.result(), None))
+                except Exception as exc:
+                    results.append((candidate, None, exc))
+        return results
 
     @staticmethod
     def _row_channel_key(row: dict[str, Any]) -> str:
@@ -188,8 +332,8 @@ class DiscoveryWorker:
         candidate_limit: int = 50,
         max_seed_discoveries: int | None = None,
     ) -> dict[str, int]:
-        safe_limit = max(1, min(200, int(candidate_limit)))
-        seed_limit = int(max_seed_discoveries or max(1, min(10, (safe_limit + 9) // 10)))
+        safe_limit = max(1, min(250, int(candidate_limit)))
+        seed_limit = int(max_seed_discoveries) if max_seed_discoveries is not None else None
         return self.run_once(
             max_seed_discoveries=seed_limit,
             max_candidate_inspections=safe_limit,
@@ -264,7 +408,13 @@ class DiscoveryWorker:
 
 
 class DiscoveryLoop:
-    def __init__(self, worker: DiscoveryWorker, *, interval_seconds: int = 300, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        worker: DiscoveryWorker,
+        *,
+        interval_seconds: int = 300,
+        enabled: bool = True,
+    ) -> None:
         self.worker = worker
         self.interval_seconds = max(5, int(interval_seconds))
         self._stop = threading.Event()
@@ -275,6 +425,21 @@ class DiscoveryLoop:
         self._pause_lock = threading.Lock()
         self._paused_until = 0.0
         self._thread: threading.Thread | None = None
+        self._event_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_event_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        self._event_callback = callback
+        if hasattr(self.worker, "set_event_callback"):
+            self.worker.set_event_callback(callback)
+
+    def _emit_event(self, payload: dict[str, Any]) -> None:
+        callback = self._event_callback
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            pass
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -325,7 +490,11 @@ class DiscoveryLoop:
                 self._wake.wait(min(self.interval_seconds, remaining))
                 continue
             try:
-                self.worker.run_once()
+                summary = self.worker.run_once()
+                if summary.get("verified"):
+                    self._emit_event({"event": "catalog_changed", "summary": summary})
+                elif summary.get("inspected") or summary.get("related_candidates"):
+                    self._emit_event({"event": "summary_dirty", "summary": summary})
             except Exception:
                 pass
             self._wake.wait(self.interval_seconds)

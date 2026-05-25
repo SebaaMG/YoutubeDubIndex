@@ -94,10 +94,14 @@ class YouTubeService:
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 12,
+            "extractor_retries": 1,
+            "retries": 1,
+            "file_access_retries": 1,
             "extract_flat": False,
             "js_runtimes": {"node": {}},
             "remote_components": ["ejs:github"],
-            "extractor_args": {"youtube": {"player_client": ["all"]}},
+            "extractor_args": {"youtube": {"player_client": ["web_embedded", "web"]}},
         }
 
     def startup_diagnostics(self) -> StartupDiagnostics:
@@ -121,6 +125,10 @@ class YouTubeService:
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 12,
+            "extractor_retries": 1,
+            "retries": 1,
+            "file_access_retries": 1,
             "extract_flat": True,
             "playlistend": max_candidates,
         }
@@ -155,17 +163,11 @@ class YouTubeService:
         original_audio_languages = self.extract_original_audio_languages_from_payload(payload)
         metadata = self.extract_video_metadata_from_payload(payload)
         info: dict[str, Any] | None = None
-        needs_original_audio_probe = (
-            bool(audio_languages)
-            and any(self.is_spanish_language(language) for language in audio_languages)
-            and not original_audio_languages
-        )
         if (
             published_at is None
             or view_count is None
             or not metadata.get("channel")
             or self.metadata_needs_ytdlp(video_id, metadata)
-            or needs_original_audio_probe
         ):
             try:
                 info = self.extract_video_info(video_id)
@@ -189,6 +191,12 @@ class YouTubeService:
             self.extract_auto_dubbed_languages_from_payload(payload),
             self.extract_auto_dubbed_languages_from_info(info or {}),
         )
+        normalized_audio_languages = normalize_audio_languages(audio_languages)
+        spanish_non_original_inferred = (
+            len(normalized_audio_languages) > 1
+            and not original_audio_languages
+            and any(self.is_spanish_language(language) for language in normalized_audio_languages)
+        )
         return InspectionResult(
             audio_languages=audio_languages,
             published_at=published_at,
@@ -201,7 +209,8 @@ class YouTubeService:
                 "source": "inspection",
                 "auto_dubbed_languages": auto_dubbed_languages,
                 "original_audio_languages": original_audio_languages,
-                "languages": normalize_audio_languages(audio_languages),
+                "languages": normalized_audio_languages,
+                "spanish_non_original_inferred": spanish_non_original_inferred,
             },
             **metadata,
         )

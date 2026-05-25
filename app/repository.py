@@ -285,6 +285,7 @@ class Repository:
         is_auto_dubbed: bool | None,
         auto_dubbed_languages: list[str] | None = None,
         original_audio_languages: list[str] | None = None,
+        infer_spanish_non_original: bool = False,
         evidence_source: str,
     ) -> None:
         conn.execute("DELETE FROM video_audio_tracks WHERE video_id = ?", (video_id,))
@@ -294,6 +295,12 @@ class Repository:
         auto_language_bases = {audio_language_base(language) for language in normalized_auto_languages}
         original_language_codes = set(normalized_original_languages)
         original_language_bases = {audio_language_base(language) for language in normalized_original_languages}
+        normalized_languages = normalize_audio_languages(languages)
+        infer_spanish_dub_track = (
+            bool(infer_spanish_non_original)
+            and len(normalized_languages) > 1
+            and not normalized_original_languages
+        )
         rows = [
             (
                 video_id,
@@ -314,11 +321,13 @@ class Repository:
                     if language in original_language_codes or audio_language_base(language) in original_language_bases
                     else 0
                     if normalized_original_languages
+                    else 0
+                    if infer_spanish_dub_track and audio_language_base(language) == "es"
                     else None
                 ),
                 evidence_source,
             )
-            for language in normalize_audio_languages(languages)
+            for language in normalized_languages
         ]
         if rows:
             conn.executemany(
@@ -447,11 +456,21 @@ class Repository:
             latest_run = conn.execute(
                 "SELECT * FROM scrape_runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
+            latest_discovery = conn.execute(
+                """
+                SELECT last_discovered_at
+                FROM discovery_seeds
+                WHERE last_discovered_at IS NOT NULL
+                ORDER BY last_discovered_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
         return {
             "active_sources": active_sources,
             "total_videos": total_videos,
             "dubbed_videos": dubbed_videos,
             "latest_run": dict(latest_run) if latest_run else None,
+            "latest_discovery_at": latest_discovery["last_discovered_at"] if latest_discovery else None,
         }
 
     def list_sources(self) -> list[dict[str, Any]]:
@@ -1270,7 +1289,7 @@ class Repository:
 
     def claim_frontier_candidates(self, *, limit: int = 10) -> list[dict[str, Any]]:
         timestamp = to_iso()
-        safe_limit = max(1, min(200, int(limit)))
+        safe_limit = max(1, min(250, int(limit)))
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
@@ -1314,6 +1333,24 @@ class Repository:
                     (timestamp, *ids),
                 )
         return [dict(row) for row in rows]
+
+    def recover_frontier_candidates(self, *, stale_after_minutes: int = 5) -> int:
+        cutoff = to_iso(utc_now() - timedelta(minutes=max(1, int(stale_after_minutes))))
+        timestamp = to_iso()
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE candidate_frontier
+                SET state = 'queued',
+                    not_before = ?,
+                    updated_at = ?,
+                    last_error = COALESCE(last_error, 'Reintentado tras cierre inesperado.')
+                WHERE state = 'inspecting'
+                  AND updated_at <= ?
+                """,
+                (timestamp, timestamp, cutoff),
+            )
+        return int(cursor.rowcount)
 
     def list_frontier_candidates(self) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
@@ -2138,6 +2175,7 @@ class Repository:
                 is_auto_dubbed=None,
                 auto_dubbed_languages=auto_dubbed_languages,
                 original_audio_languages=original_audio_languages,
+                infer_spanish_non_original=bool(evidence_dict.get("spanish_non_original_inferred")),
                 evidence_source=str(evidence_dict.get("source") or "inspection"),
             )
             self._refresh_video_metadata_complete(conn, video_id)
@@ -2312,6 +2350,7 @@ class Repository:
                     is_auto_dubbed=None,
                     auto_dubbed_languages=auto_dubbed_languages,
                     original_audio_languages=original_audio_languages,
+                    infer_spanish_non_original=bool(evidence_dict.get("spanish_non_original_inferred")),
                     evidence_source=str(evidence_dict.get("source") or "inspection"),
                 )
                 self._refresh_video_metadata_complete(conn, video_id)
@@ -2376,6 +2415,7 @@ class Repository:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
         query_mode: str = "legacy",
     ) -> tuple[list[str], list[Any]]:
         clauses = [
@@ -2482,6 +2522,9 @@ class Repository:
         if year_before is not None:
             clauses.append("v.published_year <= ?")
             params.append(year_before)
+        if max_duration_seconds is not None:
+            clauses.append("v.duration_seconds IS NOT NULL AND v.duration_seconds <= ?")
+            params.append(max(1, int(max_duration_seconds)))
         return clauses, params
 
     def count_catalog(
@@ -2497,6 +2540,7 @@ class Repository:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
     ) -> int:
         with self.db.connect(profile="ui_read") as conn:
             search_mode = self._catalog_search_mode(conn, query) if query else "legacy"
@@ -2514,6 +2558,7 @@ class Repository:
                 year=year,
                 year_after=year_after,
                 year_before=year_before,
+                max_duration_seconds=max_duration_seconds,
                 query_mode=search_mode,
             )
             sql = f"SELECT COUNT(*) FROM videos v WHERE {' AND '.join(clauses)}"
@@ -2533,6 +2578,7 @@ class Repository:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
         page_size: int = 100,
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -2562,6 +2608,7 @@ class Repository:
                 year=year,
                 year_after=year_after,
                 year_before=year_before,
+                max_duration_seconds=max_duration_seconds,
                 query_mode=search_mode,
             )
 
@@ -2709,6 +2756,7 @@ class Repository:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
     ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         cursor: str | None = None
@@ -2725,6 +2773,7 @@ class Repository:
                 year=year,
                 year_after=year_after,
                 year_before=year_before,
+                max_duration_seconds=max_duration_seconds,
                 page_size=500,
                 cursor=cursor,
             )

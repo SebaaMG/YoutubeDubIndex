@@ -125,6 +125,70 @@ class DiverseFeedBatchYouTubeService(FeedBatchYouTubeService):
         )
 
 
+class LargeFeedBatchYouTubeService(FakeYouTubeService):
+    def discover_related(self, video_id: str) -> list[dict[str, Any]]:
+        self.related_calls.append(video_id)
+        return [
+            {
+                "video_id": f"largefeed{i:03d}",
+                "title": f"Large feed candidate {i}",
+                "channel": "Large Feed Channel",
+                "channel_id": "large-feed",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100 + i,
+            }
+            for i in range(300)
+        ]
+
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en", "es-US"],
+            original_audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title=video_id,
+            channel="Large Feed Channel",
+            channel_id="large-feed",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
+class SparseSeedBatchYouTubeService(FakeYouTubeService):
+    def discover_related(self, video_id: str) -> list[dict[str, Any]]:
+        self.related_calls.append(video_id)
+        return [
+            {
+                "video_id": f"{video_id}_candidate_{index}",
+                "title": f"{video_id} candidate {index}",
+                "channel": f"Sparse Channel {video_id}",
+                "channel_id": f"sparse-{video_id}",
+                "duration_seconds": 120,
+                "thumbnail_url": "thumb.jpg",
+                "published_at": "2026-04-20",
+                "view_count": 100 + index,
+            }
+            for index in range(5)
+        ]
+
+    def inspect_video(self, video_id: str) -> InspectionResult:
+        self.inspect_calls.append(video_id)
+        return InspectionResult(
+            audio_languages=["en", "es-US"],
+            original_audio_languages=["en"],
+            published_at="2026-04-20",
+            view_count=100,
+            title=video_id,
+            channel="Sparse Channel",
+            channel_id="sparse",
+            duration_seconds=120,
+            thumbnail_url="thumb.jpg",
+        )
+
+
 class MixedSeedYouTubeService(FakeYouTubeService):
     def __init__(self) -> None:
         super().__init__()
@@ -305,6 +369,49 @@ class DiscoveryWorkerTests(unittest.TestCase):
             page_size=100,
         )
         self.assertEqual(len(catalog["items"]), 50)
+
+    def test_manual_feed_batch_allows_two_hundred_fifty_candidates_per_click(self) -> None:
+        youtube = LargeFeedBatchYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        events: list[dict[str, object]] = []
+        worker.set_event_callback(events.append)
+        self.repo.create_discovery_seed(
+            seed_kind="starter_video",
+            source_type="video",
+            label="Seed",
+            value="seed123",
+            priority=80,
+        )
+
+        summary = worker.run_manual_feed_batch(candidate_limit=250, max_seed_discoveries=1)
+
+        self.assertEqual(len(youtube.inspect_calls), 250)
+        self.assertEqual(summary["related_candidates"], 300)
+        self.assertEqual(summary["inspected"], 250)
+        self.assertEqual(summary["verified"], 250)
+        progress_events = [event for event in events if event.get("event") == "discovery_progress"]
+        self.assertEqual([event["inspected"] for event in progress_events], [50, 100, 150, 200, 250])
+        self.assertEqual([event["target"] for event in progress_events], [250, 250, 250, 250, 250])
+
+    def test_manual_feed_refills_sparse_seed_batches_until_two_hundred_fifty_inspections(self) -> None:
+        youtube = SparseSeedBatchYouTubeService()
+        worker = DiscoveryWorker(self.repo, youtube, self.settings)
+        for index in range(60):
+            self.repo.create_discovery_seed(
+                seed_kind="related_video",
+                source_type="video",
+                label=f"Seed {index}",
+                value=f"seed{index:02d}",
+                priority=80,
+            )
+
+        summary = worker.run_manual_feed_batch(candidate_limit=250)
+
+        self.assertEqual(len(youtube.related_calls), 50)
+        self.assertEqual(len(youtube.inspect_calls), 250)
+        self.assertEqual(summary["related_candidates"], 250)
+        self.assertEqual(summary["inspected"], 250)
+        self.assertEqual(summary["verified"], 250)
 
     def test_manual_feed_batch_batches_database_writes(self) -> None:
         db = CountingDatabase(self.settings.db_path)

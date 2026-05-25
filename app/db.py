@@ -196,6 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_videos_catalog_has_recent ON videos(has_dubbing, 
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_year_recent ON videos(published_year DESC, published_at DESC, video_id DESC) WHERE catalog_visible = 1;
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_channel_recent ON videos(channel COLLATE NOCASE, published_at DESC, video_id DESC) WHERE catalog_visible = 1;
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_random ON videos(random_key, video_id) WHERE catalog_visible = 1;
+CREATE INDEX IF NOT EXISTS idx_videos_catalog_duration ON videos(duration_seconds, published_at DESC, video_id DESC) WHERE catalog_visible = 1 AND duration_seconds IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_visible_channel ON videos(catalog_visible, channel COLLATE NOCASE) WHERE channel IS NOT NULL AND channel != '';
 CREATE INDEX IF NOT EXISTS idx_videos_catalog_visible_year ON videos(catalog_visible, published_year DESC) WHERE published_year IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_videos_metadata_queue ON videos(metadata_complete, dub_classifier_version, metadata_sort_at, video_id) WHERE inspect_status = 'ok';

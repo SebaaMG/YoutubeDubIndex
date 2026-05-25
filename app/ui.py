@@ -67,7 +67,7 @@ YOUTUBE_FIRST_YEAR = 2005
 CATALOG_CARD_BATCH_SIZE = 32
 CATALOG_PAGE_SIZE = 160
 STARTUP_BACKFILL_DELAY_MS = 2500
-MANUAL_DISCOVERY_CANDIDATE_LIMIT = 200
+MANUAL_DISCOVERY_CANDIDATE_LIMIT = 250
 THUMBNAIL_RENDER_SCALE = 1.0
 CATALOG_BACKGROUND_COUNT_MAX_VIDEOS = 100_000
 CATALOG_THUMBNAIL_PREFETCH_ROWS = 30
@@ -685,6 +685,18 @@ def make_year_combo(empty_text: str) -> CatalogFilterComboBox:
     return combo
 
 
+def make_max_duration_combo() -> CatalogFilterComboBox:
+    combo = CatalogFilterComboBox()
+    combo.setEditable(False)
+    combo.addItem("Cualquier duración", None)
+    for minutes in range(10, 61, 10):
+        combo.addItem(f"Hasta {minutes} min", minutes * 60)
+    style_combo_popup(combo)
+    combo.setMaxVisibleItems(8)
+    combo.setCurrentIndex(0)
+    return combo
+
+
 def combo_year_value(combo: QComboBox) -> int | None:
     data = combo.currentData()
     if isinstance(data, int):
@@ -697,6 +709,13 @@ def combo_year_value(combo: QComboBox) -> int | None:
         current_year = datetime.now().year
         if YOUTUBE_FIRST_YEAR <= year <= current_year:
             return year
+    return None
+
+
+def combo_duration_value(combo: QComboBox) -> int | None:
+    data = combo.currentData()
+    if isinstance(data, int) and data > 0:
+        return data
     return None
 
 
@@ -841,6 +860,25 @@ def relative_time(value: str | None) -> str:
     if seconds < 86400:
         return f"hace {seconds // 3600} h"
     return f"hace {seconds // 86400} d"
+
+
+def latest_timestamp(*values: str | None) -> str | None:
+    latest_value: str | None = None
+    latest_dt: datetime | None = None
+    for value in values:
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.astimezone(timezone.utc)
+        if latest_dt is None or parsed > latest_dt:
+            latest_dt = parsed
+            latest_value = str(value)
+    return latest_value
 
 
 def humanize_exception(error: Exception) -> str:
@@ -2141,6 +2179,8 @@ class MainWindow(QMainWindow):
         self._catalog_count_threads: list[threading.Thread] = []
         self._active_run_snapshot_threads: list[threading.Thread] = []
         self._active_run_snapshot_loading = False
+        self._active_run_progress: dict[str, Any] | None = None
+        self._active_discovery_progress: dict[str, Any] | None = None
         self._ui_action_threads: list[threading.Thread] = []
         self._ui_action_handlers: dict[int, dict[str, Any]] = {}
         self._ui_action_generation = 0
@@ -2440,7 +2480,7 @@ class MainWindow(QMainWindow):
         self.metric_dubbed = MetricCard("Videos doblados", accent=True, icon_text="🎙", icon_bg="#0d2a3f")
         self.metric_sources = MetricCard("Búsquedas activas", icon_text="🔍", icon_bg="#14293e")
         self.metric_scanned = MetricCard("Videos revisados", icon_text="📊", icon_bg="#14293e")
-        self.metric_last_run = MetricCard("Última búsqueda", icon_text="⏱", icon_bg="#14293e")
+        self.metric_last_run = MetricCard("Última actividad", icon_text="⏱", icon_bg="#14293e")
         for metric in (self.metric_dubbed, self.metric_sources, self.metric_scanned, self.metric_last_run):
             metrics_row.addWidget(metric)
         metrics_row.addStretch(1)
@@ -2849,6 +2889,10 @@ class MainWindow(QMainWindow):
 
         self.catalog_before_year = make_year_combo("Sin fecha máxima")
         self.catalog_before_year.setMinimumWidth(180)
+
+        self.catalog_max_duration = make_max_duration_combo()
+        self.catalog_max_duration.setMinimumWidth(190)
+
         self.catalog_favorites_only = QCheckBox("Mostrar solo favoritos")
         self.catalog_favorites_only.setProperty("catalogFavoriteFilter", "true")
 
@@ -2870,6 +2914,7 @@ class MainWindow(QMainWindow):
             self.catalog_year,
             self.catalog_after_year,
             self.catalog_before_year,
+            self.catalog_max_duration,
         ):
             style_combo_popup(combo)
         for combo in (self.catalog_year, self.catalog_after_year, self.catalog_before_year):
@@ -2935,6 +2980,7 @@ class MainWindow(QMainWindow):
         filters_layout.addWidget(inline_field("Subidos desde", self.catalog_after_year), 1, 0)
         filters_layout.addWidget(inline_field("Subidos hasta", self.catalog_before_year), 1, 1)
         filters_layout.addWidget(inline_field("Tipo de dub", self.catalog_dub_kind), 1, 2)
+        filters_layout.addWidget(inline_field("Duración máxima", self.catalog_max_duration), 1, 3)
         filters_layout.addWidget(self.catalog_favorites_only, 2, 2, alignment=Qt.AlignBottom)
         filters_layout.addWidget(self.catalog_clear_filters_button, 2, 3, alignment=Qt.AlignBottom)
         self.catalog_filters_panel.hide()
@@ -3020,6 +3066,7 @@ class MainWindow(QMainWindow):
             self.catalog_visibility,
             self.catalog_dub_kind,
             self.catalog_sort,
+            self.catalog_max_duration,
         ):
             combo.currentIndexChanged.connect(self.refresh_catalog)
         self.catalog_year.currentIndexChanged.connect(self.handle_exact_year_filter_changed)
@@ -3263,6 +3310,7 @@ class MainWindow(QMainWindow):
             self.catalog_year,
             self.catalog_after_year,
             self.catalog_before_year,
+            self.catalog_max_duration,
             self.catalog_favorites_only,
         ]
         for widget in widgets:
@@ -3280,6 +3328,7 @@ class MainWindow(QMainWindow):
         self.set_combo_by_data(self.catalog_year, None)
         self.set_combo_by_data(self.catalog_after_year, None)
         self.set_combo_by_data(self.catalog_before_year, None)
+        self.set_combo_by_data(self.catalog_max_duration, None)
         self.catalog_favorites_only.setChecked(False)
 
         for widget in widgets:
@@ -3672,10 +3721,10 @@ class MainWindow(QMainWindow):
         self.metric_sources.set_value(str(active_sources))
         self.metric_scanned.set_value(str(stats.get("total_videos", 0)))
         latest_run = stats.get("latest_run")
-        if latest_run:
-            self.metric_last_run.set_value(
-                relative_time(latest_run.get("finished_at") or latest_run.get("started_at"))
-            )
+        latest_run_at = latest_run.get("finished_at") or latest_run.get("started_at") if latest_run else None
+        latest_activity_at = latest_timestamp(stats.get("latest_discovery_at"), latest_run_at)
+        if latest_activity_at:
+            self.metric_last_run.set_value(relative_time(latest_activity_at))
         else:
             self.metric_last_run.set_value("—")
 
@@ -4051,6 +4100,7 @@ class MainWindow(QMainWindow):
     def apply_topbar_status(self, active_run: dict[str, Any] | None) -> None:
         source_lookup = {int(source["id"]): source["label"] for source in self._source_rows}
         if active_run:
+            self._active_run_progress = dict(active_run)
             scope = pretty_run_scope(active_run["scope"], source_lookup)
             checked = int(active_run.get("videos_checked") or 0)
             total = int(active_run.get("candidates_found") or 0)
@@ -4066,13 +4116,54 @@ class MainWindow(QMainWindow):
             self.topbar_progress.show()
             return
 
+        if self._active_discovery_progress is not None:
+            self.apply_discovery_progress(self._active_discovery_progress)
+            return
+
+        self._active_run_progress = None
         self.topbar_progress.hide()
         latest_run = self._latest_stats.get("latest_run")
-        if latest_run:
-            when = relative_time(latest_run.get("finished_at") or latest_run.get("started_at"))
-            self.topbar_status_label.setText(f"Última búsqueda: {when}")
+        latest_run_at = latest_run.get("finished_at") or latest_run.get("started_at") if latest_run else None
+        latest_discovery_at = self._latest_stats.get("latest_discovery_at")
+        latest_activity_at = latest_timestamp(latest_discovery_at, latest_run_at)
+        if latest_activity_at:
+            when = relative_time(latest_activity_at)
+            label = "automática" if latest_activity_at == latest_discovery_at else "búsqueda"
+            self.topbar_status_label.setText(f"Última {label}: {when}")
         else:
             self.topbar_status_label.setText("Aún no has buscado videos")
+
+    def apply_run_progress_event(self, event: dict[str, Any]) -> None:
+        source_lookup = {int(source["id"]): source["label"] for source in self._source_rows}
+        progress = dict(self._active_run_progress or {})
+        progress.update(event)
+        self._active_run_progress = progress
+        scope = pretty_run_scope(str(progress.get("scope") or progress.get("run_scope") or "metadata"), source_lookup)
+        checked = int(progress.get("videos_checked") or 0)
+        total = int(progress.get("candidates_found") or 0)
+        dubbed = int(progress.get("dubbed_found") or 0)
+        if total > 0:
+            safe_total = max(total, checked, 1)
+            self.topbar_progress.setRange(0, safe_total)
+            self.topbar_progress.setValue(min(checked, safe_total))
+            self.topbar_status_label.setText(f"Buscando en {scope}… {checked}/{safe_total} · {dubbed} doblados")
+        else:
+            self.topbar_progress.setRange(0, 0)
+            self.topbar_status_label.setText(f"Buscando en {scope}… preparando revisión")
+        self.topbar_progress.show()
+
+    def apply_discovery_progress(self, event: dict[str, Any]) -> None:
+        inspected = int(event.get("inspected") or 0)
+        target = max(int(event.get("target") or 0), inspected, 1)
+        verified = int(event.get("verified") or 0)
+        failed = int(event.get("failed") or 0)
+        self.topbar_progress.setRange(0, target)
+        self.topbar_progress.setValue(min(inspected, target))
+        suffix = f"{inspected}/{target} · {verified} doblados"
+        if failed:
+            suffix += f" · {failed} fallidos"
+        self.topbar_status_label.setText(f"Explorando videos… {suffix}")
+        self.topbar_progress.show()
 
     def request_active_run_snapshot(self, active_run_id: int) -> None:
         if self._active_run_snapshot_loading or self._closing:
@@ -4434,6 +4525,7 @@ class MainWindow(QMainWindow):
             "year": combo_year_value(self.catalog_year),
             "year_after": combo_year_value(self.catalog_after_year),
             "year_before": combo_year_value(self.catalog_before_year),
+            "max_duration_seconds": combo_duration_value(self.catalog_max_duration),
         }
 
     def refresh_catalog(self, *_args: object) -> None:
@@ -4633,6 +4725,7 @@ class MainWindow(QMainWindow):
                     year=filters.get("year"),
                     year_after=filters.get("year_after"),
                     year_before=filters.get("year_before"),
+                    max_duration_seconds=filters.get("max_duration_seconds"),
                     page_size=requested_page_size,
                     cursor=cursor,
                 )
@@ -4736,6 +4829,7 @@ class MainWindow(QMainWindow):
             or filters.get("year")
             or filters.get("year_after")
             or filters.get("year_before")
+            or filters.get("max_duration_seconds")
         )
 
     def start_catalog_count_worker(self, generation: int, filters: dict[str, Any]) -> None:
@@ -4752,6 +4846,7 @@ class MainWindow(QMainWindow):
                     year=filters["year"],
                     year_after=filters["year_after"],
                     year_before=filters["year_before"],
+                    max_duration_seconds=filters["max_duration_seconds"],
                 )
             except Exception:
                 return
@@ -5029,6 +5124,7 @@ class MainWindow(QMainWindow):
             self.catalog_model.set_favorite(video_id, is_favorite)
 
     def _tick_refresh(self) -> None:
+        self._drain_worker_events()
         active_run_id = self.controller.active_run_id()
         if active_run_id is not None:
             if self._last_active_run_id is None:
@@ -5041,6 +5137,49 @@ class MainWindow(QMainWindow):
         if self._last_active_run_id is not None:
             self._last_active_run_id = None
             self.request_summary_refresh()
+            if self._current_page_key == "catalog":
+                self.refresh_catalog()
+            else:
+                self._catalog_dirty = True
+
+    def _drain_worker_events(self) -> None:
+        worker_client = getattr(self.services, "worker_client", None)
+        if worker_client is None or not hasattr(worker_client, "drain_events"):
+            return
+        try:
+            events = worker_client.drain_events(limit=100)
+        except Exception:
+            return
+        if not events or self._closing:
+            return
+        catalog_changed = False
+        summary_dirty = False
+        for event in events:
+            event_name = str(event.get("event") or "")
+            if event_name == "catalog_changed":
+                catalog_changed = True
+                summary_dirty = True
+            elif event_name == "run_started":
+                self._active_run_progress = dict(event)
+                summary_dirty = True
+            elif event_name == "run_progress":
+                self.apply_run_progress_event(event)
+                summary_dirty = True
+            elif event_name == "run_finished":
+                self._active_run_progress = None
+                summary_dirty = True
+            elif event_name == "discovery_progress":
+                self._active_discovery_progress = dict(event)
+                self.apply_discovery_progress(event)
+                summary_dirty = True
+            elif event_name == "discovery_finished":
+                self._active_discovery_progress = None
+                summary_dirty = True
+            elif event_name == "summary_dirty":
+                summary_dirty = True
+        if summary_dirty:
+            self.request_summary_refresh()
+        if catalog_changed:
             if self._current_page_key == "catalog":
                 self.refresh_catalog()
             else:

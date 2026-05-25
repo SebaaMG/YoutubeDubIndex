@@ -19,7 +19,15 @@ from app.config import Settings
 from app.db import Database
 from app.desktop_services import AppController, DesktopServices
 from app.repository import SPANISH_LANGUAGE_FILTER, CandidateVideo, Repository, SourceInput, to_iso
-from app.ui import APP_STYLE, THUMBNAIL_RENDER_SCALE, YOUTUBE_FIRST_YEAR, MainWindow, ThumbnailService, combo_year_value
+from app.ui import (
+    APP_STYLE,
+    THUMBNAIL_RENDER_SCALE,
+    YOUTUBE_FIRST_YEAR,
+    MainWindow,
+    ThumbnailService,
+    combo_duration_value,
+    combo_year_value,
+)
 from app.youtube import StartupDiagnostics, YouTubeService
 
 
@@ -130,6 +138,20 @@ class FakeRunner:
             run_id = len(self.calls)
         self._active_run_id = run_id
         return run_id
+
+
+class FakeProgressWorkerClient:
+    def __init__(self, events: list[dict[str, object]], active_run_id: int | None = None) -> None:
+        self.events = list(events)
+        self._active_run_id = active_run_id
+
+    def active_run_id(self) -> int | None:
+        return self._active_run_id
+
+    def drain_events(self, *, limit: int = 50) -> list[dict[str, object]]:
+        batch = self.events[:limit]
+        self.events = self.events[limit:]
+        return batch
 
 
 class FakeDiscoveryWorker:
@@ -251,6 +273,54 @@ class CatalogUiTests(unittest.TestCase):
         self.assertIs(toggles[0], self.window.automatic_discovery_toggle)
         self.assertTrue(toggles[0].isChecked())
 
+    def test_worker_progress_events_update_topbar_without_waiting_for_snapshot(self) -> None:
+        self.services.worker_client = FakeProgressWorkerClient(
+            [
+                {
+                    "event": "run_progress",
+                    "run_id": 7,
+                    "scope": "metadata",
+                    "videos_checked": 50,
+                    "candidates_found": 250,
+                    "dubbed_found": 42,
+                }
+            ],
+            active_run_id=7,
+        )  # type: ignore[assignment]
+        self.window.show()
+        self.app.processEvents()
+
+        self.window._drain_worker_events()
+
+        self.assertTrue(self.window.topbar_progress.isVisible())
+        self.assertEqual(self.window.topbar_progress.maximum(), 250)
+        self.assertEqual(self.window.topbar_progress.value(), 50)
+        self.assertIn("50/250", self.window.topbar_status_label.text())
+        self.assertIn("42 doblados", self.window.topbar_status_label.text())
+
+    def test_discovery_progress_events_update_topbar_every_chunk(self) -> None:
+        self.services.worker_client = FakeProgressWorkerClient(
+            [
+                {
+                    "event": "discovery_progress",
+                    "target": 250,
+                    "inspected": 100,
+                    "verified": 63,
+                    "failed": 1,
+                }
+            ]
+        )  # type: ignore[assignment]
+        self.window.show()
+        self.app.processEvents()
+
+        self.window._drain_worker_events()
+
+        self.assertTrue(self.window.topbar_progress.isVisible())
+        self.assertEqual(self.window.topbar_progress.maximum(), 250)
+        self.assertEqual(self.window.topbar_progress.value(), 100)
+        self.assertIn("100/250", self.window.topbar_status_label.text())
+        self.assertIn("63 doblados", self.window.topbar_status_label.text())
+
     def test_catalog_shows_essential_controls_and_collapsed_filters(self) -> None:
         self.window.resize(1600, 1000)
         self.window.switch_page("catalog")
@@ -297,6 +367,7 @@ class CatalogUiTests(unittest.TestCase):
             self.window.catalog_year,
             self.window.catalog_after_year,
             self.window.catalog_before_year,
+            self.window.catalog_max_duration,
         )
 
         self.assertTrue(all(isinstance(combo, ui_module.CatalogFilterComboBox) for combo in combos))
@@ -1178,6 +1249,7 @@ class CatalogUiTests(unittest.TestCase):
                 year=calls[0]["filters"].get("year"),
                 year_after=calls[0]["filters"].get("year_after"),
                 year_before=calls[0]["filters"].get("year_before"),
+                max_duration_seconds=calls[0]["filters"].get("max_duration_seconds"),
                 page_size=ui_module.CATALOG_PAGE_SIZE,
                 cursor=str(calls[0]["cursor"]),
             )
@@ -1191,14 +1263,14 @@ class CatalogUiTests(unittest.TestCase):
         finally:
             ui_module.CATALOG_PAGE_SIZE = original_page_size
 
-    def test_manual_feed_button_runs_two_hundred_candidate_expansion(self) -> None:
+    def test_manual_feed_button_runs_two_hundred_fifty_candidate_expansion(self) -> None:
         worker = FakeDiscoveryWorker()
         self.services.discovery_worker = worker  # type: ignore[assignment]
         self.window.switch_page("catalog")
         self.window.show()
         self.app.processEvents()
 
-        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 200")
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 250")
         self.window.catalog_manual_discovery_button.click()
         for _ in range(100):
             self.app.processEvents()
@@ -1206,8 +1278,8 @@ class CatalogUiTests(unittest.TestCase):
                 break
             time.sleep(0.01)
 
-        self.assertEqual(worker.calls, [{"candidate_limit": 200, "max_seed_discoveries": 10}])
-        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 200")
+        self.assertEqual(worker.calls, [{"candidate_limit": 250, "max_seed_discoveries": None}])
+        self.assertEqual(self.window.catalog_manual_discovery_button.text(), "Explorar 250")
         self.assertTrue(self.window.catalog_manual_discovery_button.isEnabled())
 
     def test_catalog_year_controls_offer_scrollable_youtube_year_range(self) -> None:
@@ -1226,6 +1298,31 @@ class CatalogUiTests(unittest.TestCase):
         self.assertEqual(self.window.catalog_year.itemData(1), datetime.now().year)
         self.assertEqual(self.window.catalog_year.itemData(self.window.catalog_year.count() - 1), YOUTUBE_FIRST_YEAR)
         self.assertEqual(self.window.catalog_year.itemData(1), self.window.catalog_after_year.itemData(1))
+
+    def test_catalog_max_duration_filter_options_and_query(self) -> None:
+        self.window.switch_page("catalog")
+        self.window.show()
+        self.app.processEvents()
+        self.window.refresh_catalog()
+        wait_for_catalog_idle(self.window, self.app)
+
+        self.assertEqual(self.window.catalog_max_duration.itemText(0), "Cualquier duración")
+        self.assertEqual(
+            [
+                self.window.catalog_max_duration.itemData(index)
+                for index in range(1, self.window.catalog_max_duration.count())
+            ],
+            [minutes * 60 for minutes in range(10, 61, 10)],
+        )
+
+        self.window.catalog_max_duration.setCurrentIndex(self.window.catalog_max_duration.findData(10 * 60))
+        wait_for_catalog_idle(self.window, self.app)
+        self.assertEqual(self.window.catalog_model.rowCount(), 0)
+
+        self.window.catalog_max_duration.setCurrentIndex(self.window.catalog_max_duration.findData(30 * 60))
+        wait_for_catalog_idle(self.window, self.app)
+        self.assertEqual([item["video_id"] for item in self.window._catalog_rows], ["abc123"])
+        self.assertEqual(combo_duration_value(self.window.catalog_max_duration), 30 * 60)
 
     def test_catalog_year_range_filters_work_from_selectors(self) -> None:
         self.repo.upsert_candidate(
@@ -1365,6 +1462,7 @@ class CatalogUiTests(unittest.TestCase):
         self.window.catalog_year.setCurrentIndex(max(0, self.window.catalog_year.findData(2026)))
         self.window.catalog_after_year.setCurrentIndex(max(0, self.window.catalog_after_year.findData(2026)))
         self.window.catalog_before_year.setCurrentIndex(max(0, self.window.catalog_before_year.findData(2026)))
+        self.window.catalog_max_duration.setCurrentIndex(max(0, self.window.catalog_max_duration.findData(30 * 60)))
         self.window.catalog_favorites_only.setChecked(True)
 
         self.window.clear_catalog_filters()
@@ -1379,6 +1477,7 @@ class CatalogUiTests(unittest.TestCase):
         self.assertIsNone(self.window.catalog_year.currentData())
         self.assertIsNone(self.window.catalog_after_year.currentData())
         self.assertIsNone(self.window.catalog_before_year.currentData())
+        self.assertIsNone(self.window.catalog_max_duration.currentData())
         self.assertFalse(self.window.catalog_favorites_only.isChecked())
 
     def test_favorite_toggle_is_optimistic_and_rolls_back_on_error(self) -> None:

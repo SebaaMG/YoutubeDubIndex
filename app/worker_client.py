@@ -27,6 +27,7 @@ class SearchWorkerProcessClient:
         self._write_lock = threading.Lock()
         self._response_lock = threading.Lock()
         self._responses: dict[str, queue.Queue[dict[str, Any]]] = {}
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._next_id = 0
         self._active_run_id: int | None = None
         self._last_error: str | None = None
@@ -164,9 +165,20 @@ class SearchWorkerProcessClient:
                 self._active_run_id = None
         elif event == "error":
             self._last_error = str(message.get("message") or "")
+        if event:
+            self._events.put(dict(message))
 
     def active_run_id(self) -> int | None:
         return self._active_run_id
+
+    def drain_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for _ in range(max(1, int(limit))):
+            try:
+                events.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return events
 
     def stop(self, *, wait: bool = False) -> None:
         process = self._process

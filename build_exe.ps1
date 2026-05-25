@@ -39,6 +39,17 @@ tmp_path.replace(destination_path)
 '@ | python -
 }
 
+$distRoot = Join-Path $root "dist\YouTubeDubIndexer"
+$explicitSourceBackupDb = $null
+if ($SourceDb) {
+    if (-not (Test-Path -LiteralPath $SourceDb)) {
+        throw "SourceDb does not exist: $SourceDb"
+    }
+    $explicitSourceBackupDb = Join-Path ([System.IO.Path]::GetTempPath()) ("youtubeindex-explicit-source-db-{0}.db" -f [System.Guid]::NewGuid().ToString("N"))
+    Export-SqliteDatabase -SourceDb $SourceDb -DestinationDb $explicitSourceBackupDb
+    $SourceDb = $explicitSourceBackupDb
+}
+
 function Get-CatalogUsefulCount {
     param([Parameter(Mandatory=$true)][string]$DbPath)
 
@@ -81,7 +92,6 @@ if (Test-Path -LiteralPath $existingPortableDb) {
     Export-SqliteDatabase -SourceDb $existingPortableDb -DestinationDb $portableBackupDb
 }
 
-$distRoot = Join-Path $root "dist\YouTubeDubIndexer"
 if (Test-Path -LiteralPath $distRoot) {
     Get-ChildItem -LiteralPath $distRoot -Recurse -Force -File |
         ForEach-Object { $_.Attributes = [System.IO.FileAttributes]::Normal }
@@ -89,6 +99,16 @@ if (Test-Path -LiteralPath $distRoot) {
 
 python -m pip install -r requirements.txt
 python -m PyInstaller --noconfirm YouTubeDubIndexer.spec
+
+$workerExe = Join-Path $root "dist\YouTubeDubIndexer\YouTubeDubIndexerWorker.exe"
+$internalWorkerExe = Join-Path $root "dist\YouTubeDubIndexer\_internal\YouTubeDubIndexerWorker.exe"
+if (Test-Path -LiteralPath $workerExe) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $internalWorkerExe) -Force | Out-Null
+    if (Test-Path -LiteralPath $internalWorkerExe) {
+        Remove-Item -LiteralPath $internalWorkerExe -Force
+    }
+    Move-Item -LiteralPath $workerExe -Destination $internalWorkerExe -Force
+}
 
 $distData = Join-Path $root "dist\YouTubeDubIndexer\data"
 $distDb = Join-Path $distData "dub_index_desktop.db"
@@ -127,15 +147,8 @@ if ($sourceDb) {
 if ($portableBackupDb -and (Test-Path -LiteralPath $portableBackupDb)) {
     Remove-Item -LiteralPath $portableBackupDb -Force
 }
-
-$workerExe = Join-Path $root "dist\YouTubeDubIndexer\YouTubeDubIndexerWorker.exe"
-$internalWorkerExe = Join-Path $root "dist\YouTubeDubIndexer\_internal\YouTubeDubIndexerWorker.exe"
-if (Test-Path -LiteralPath $workerExe) {
-    New-Item -ItemType Directory -Path (Split-Path -Parent $internalWorkerExe) -Force | Out-Null
-    if (Test-Path -LiteralPath $internalWorkerExe) {
-        Remove-Item -LiteralPath $internalWorkerExe -Force
-    }
-    Move-Item -LiteralPath $workerExe -Destination $internalWorkerExe -Force
+if ($explicitSourceBackupDb -and (Test-Path -LiteralPath $explicitSourceBackupDb)) {
+    Remove-Item -LiteralPath $explicitSourceBackupDb -Force
 }
 
 Write-Host "Built: $root\\dist\\YouTubeDubIndexer\\YouTubeDubIndexer.exe"

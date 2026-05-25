@@ -61,6 +61,7 @@ def _prepare_repository(settings: Settings, db_path: Path | None = None) -> tupl
     repo.import_content_pool(settings.content_pool_path, version=settings.content_pool_version)
     repo.repair_display_metadata_flags()
     repo.recover_scheduler_jobs()
+    repo.recover_frontier_candidates()
     return db, repo
 
 
@@ -285,7 +286,7 @@ class AppController:
             max_candidate_inspections=max_candidate_inspections,
         )
 
-    def run_manual_feed_expansion(self, *, candidate_limit: int = 200) -> dict[str, int]:
+    def run_manual_feed_expansion(self, *, candidate_limit: int = 250) -> dict[str, int]:
         if self.services.worker_client is not None:
             result = self._worker_call(
                 "run_manual_feed",
@@ -299,7 +300,6 @@ class AppController:
             return {}
         return self.services.discovery_worker.run_manual_feed_batch(
             candidate_limit=candidate_limit,
-            max_seed_discoveries=10,
         )
 
     def check_for_update(self) -> dict[str, Any]:
@@ -414,6 +414,7 @@ class AppController:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.services.repo.list_catalog(
             lang=lang or None,
@@ -427,6 +428,7 @@ class AppController:
             year=year,
             year_after=year_after,
             year_before=year_before,
+            max_duration_seconds=max_duration_seconds,
         )
 
     def count_catalog(
@@ -442,6 +444,7 @@ class AppController:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
     ) -> int:
         return self.services.repo.count_catalog(
             lang=lang or None,
@@ -454,6 +457,7 @@ class AppController:
             year=year,
             year_after=year_after,
             year_before=year_before,
+            max_duration_seconds=max_duration_seconds,
         )
 
     def list_catalog_page(
@@ -470,6 +474,7 @@ class AppController:
         year: int | None = None,
         year_after: int | None = None,
         year_before: int | None = None,
+        max_duration_seconds: int | None = None,
         page_size: int = 100,
         cursor: str | None = None,
     ) -> dict[str, Any]:
@@ -485,6 +490,7 @@ class AppController:
             year=year,
             year_after=year_after,
             year_before=year_before,
+            max_duration_seconds=max_duration_seconds,
             page_size=page_size,
             cursor=cursor,
         )

@@ -118,6 +118,25 @@ class RunManagerTests(unittest.TestCase):
         assert run is not None
         self.assertEqual(run["videos_checked"], 2)
 
+    def test_progress_events_are_cumulative_every_fifty_inspections(self) -> None:
+        manager = RunManager(self.repo, MetadataYouTubeService(), self.settings)
+        events: list[dict[str, object]] = []
+        manager.set_event_callback(events.append)
+        run_id = self.repo.create_run("metadata")
+        self.repo.mark_run_running(run_id)
+        video_ids = {f"vid{index:08d}" for index in range(120)}
+        source_id = self.repo.create_source(SourceInput("search", "Progress", "progress", 120, True))
+        for video_id in video_ids:
+            self.repo.upsert_candidate(
+                CandidateVideo(video_id, video_id, "Chan", "chan1", 100, None, source_id, to_iso())
+            )
+
+        manager._inspect_video_ids(run_id, video_ids)
+
+        progress_events = [event for event in events if event.get("event") == "run_progress"]
+        self.assertEqual([event["videos_checked"] for event in progress_events], [50, 100, 120])
+        self.assertEqual([event["candidates_found"] for event in progress_events], [120, 120, 120])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,12 @@ class DiscoveryWorkerJsonServer:
         runner = getattr(services, "runner", None)
         if runner is not None and hasattr(runner, "set_event_callback"):
             runner.set_event_callback(self.emit_event)
+        discovery_worker = getattr(services, "discovery_worker", None)
+        if discovery_worker is not None and hasattr(discovery_worker, "set_event_callback"):
+            discovery_worker.set_event_callback(self.emit_event)
+        discovery_loop = getattr(services, "discovery_loop", None)
+        if discovery_loop is not None and hasattr(discovery_loop, "set_event_callback"):
+            discovery_loop.set_event_callback(self.emit_event)
 
     def emit_event(self, payload: dict[str, Any]) -> None:
         if self._emit is not None:
@@ -69,7 +75,7 @@ class DiscoveryWorkerJsonServer:
         if command == "run_manual_feed":
             self._pause_background(0.5)
             summary = self.controller.run_manual_feed_expansion(
-                candidate_limit=int(payload.get("candidate_limit") or 200)
+                candidate_limit=int(payload.get("candidate_limit") or 250)
             )
             self._idle_checkpoint()
             self.emit_event({"event": "catalog_changed"})
@@ -83,12 +89,13 @@ class DiscoveryWorkerJsonServer:
             self.emit_event({"event": "catalog_changed"})
             return {"summary": summary}
         if command == "run_source":
-            run_id = self.controller.run_source(int(payload.get("source_id") or 0))
-            self.emit_event({"event": "run_started", "run_id": run_id})
+            source_id = int(payload.get("source_id") or 0)
+            run_id = self.controller.run_source(source_id)
+            self.emit_event({"event": "run_started", "run_id": run_id, "scope": f"source:{source_id}"})
             return {"run_id": run_id}
         if command == "run_all":
             run_id = self.controller.run_all()
-            self.emit_event({"event": "run_started", "run_id": run_id})
+            self.emit_event({"event": "run_started", "run_id": run_id, "scope": "all"})
             return {"run_id": run_id}
         if command == "metadata_backfill":
             raw_limit = payload.get("limit")
@@ -96,7 +103,7 @@ class DiscoveryWorkerJsonServer:
                 limit=int(raw_limit) if raw_limit is not None else None
             )
             if run_id is not None:
-                self.emit_event({"event": "run_started", "run_id": run_id})
+                self.emit_event({"event": "run_started", "run_id": run_id, "scope": "metadata"})
             return {"run_id": run_id}
         if command == "pause_background":
             self._pause_background(float(payload.get("seconds") or 0.5))

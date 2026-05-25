@@ -10,6 +10,8 @@ dist-*/
 data/
 output/
 tmp-*/
+backups/
+logs/
 
 *.dump
 *.log

@@ -47,6 +47,25 @@ class FakeWorkerClient:
         return self._active_run_id
 
 
+class FakeDiscoveryWorker:
+    def __init__(self) -> None:
+        self.manual_calls: list[dict[str, object]] = []
+
+    def run_manual_feed_batch(
+        self,
+        *,
+        candidate_limit: int,
+        max_seed_discoveries: int | None = None,
+    ) -> dict[str, int]:
+        self.manual_calls.append(
+            {
+                "candidate_limit": candidate_limit,
+                "max_seed_discoveries": max_seed_discoveries,
+            }
+        )
+        return {"inspected": candidate_limit}
+
+
 class WorkerArchitectureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -132,6 +151,27 @@ class WorkerArchitectureTests(unittest.TestCase):
 
     def test_automatic_discovery_interval_defaults_to_five_minutes(self) -> None:
         self.assertEqual(self.settings.discovery_loop_interval_seconds, 300)
+        self.assertEqual(self.settings.discovery_seed_batch, 25)
+        self.assertEqual(self.settings.discovery_inspect_batch, 250)
+
+    def test_local_manual_feed_does_not_force_legacy_ten_seed_cap(self) -> None:
+        discovery_worker = FakeDiscoveryWorker()
+        services = DesktopServices(
+            settings=self.settings,
+            db=self.db,
+            repo=self.repo,
+            youtube=None,
+            runner=None,
+            diagnostics=StartupDiagnostics(node_ok=True, ytdlp_ok=True, messages=[]),
+            discovery_worker=discovery_worker,  # type: ignore[arg-type]
+        )
+        controller = AppController(services)
+
+        self.assertEqual(controller.run_manual_feed_expansion(candidate_limit=250)["inspected"], 250)
+        self.assertEqual(
+            discovery_worker.manual_calls,
+            [{"candidate_limit": 250, "max_seed_discoveries": None}],
+        )
 
     def test_ui_read_connection_is_query_only_and_has_short_busy_timeout(self) -> None:
         with self.db.connect(profile="ui_read") as conn:

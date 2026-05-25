@@ -27,12 +27,14 @@ class Settings:
     default_search_candidates: int = 1000
     default_channel_candidates: int = 1000
     app_storage_dirname: str = "YouTubeDubIndexer"
-    discovery_seed_batch: int = 2
-    discovery_inspect_batch: int = 12
+    discovery_seed_batch: int = 25
+    discovery_inspect_batch: int = 250
+    discovery_inspection_chunk_size: int = 50
+    discovery_inspect_workers: int = 4
     discovery_seed_candidate_limit: int = 50
     discovery_loop_interval_seconds: int = 300
     starter_pack_version: str = "v3"
-    content_pool_version: str = "v4"
+    content_pool_version: str = "v9"
     update_manifest_url: str = ""
 
     @property

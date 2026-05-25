@@ -152,6 +152,20 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(default_discover_count, 1)
         self.assertEqual(stats["dubbed_videos"], default_discover_count)
 
+    def test_dashboard_stats_include_latest_discovery_scan(self) -> None:
+        seed_id = self.repo.create_discovery_seed(
+            seed_kind="system_search",
+            source_type="search",
+            label="Seed",
+            value="seed search",
+            priority=50,
+        )
+
+        self.repo.mark_discovery_seed_scanned(seed_id, delay_minutes=15)
+        stats = self.repo.dashboard_stats()
+
+        self.assertIsNotNone(stats["latest_discovery_at"])
+
     def test_catalog_can_sort_by_views_and_filter_by_year(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
 
@@ -213,6 +227,42 @@ class RepositoryTests(unittest.TestCase):
             year_after=2022,
         )
         self.assertEqual([item["video_id"] for item in after_2022], ["new1"])
+
+    def test_catalog_can_filter_by_max_duration(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
+        short_video = CandidateVideo("short1", "Short video", "Chan", "chan1", 9 * 60, None, source_id, to_iso())
+        long_video = CandidateVideo("long1", "Long video", "Chan", "chan1", 70 * 60, None, source_id, to_iso())
+        self.repo.upsert_candidate(short_video)
+        self.repo.upsert_candidate(long_video)
+        for video_id, duration in (("short1", 9 * 60), ("long1", 70 * 60)):
+            self.repo.store_inspection_result(
+                video_id,
+                audio_languages=["en", "es-US"],
+                has_dubbing=True,
+                published_at="2026-04-22",
+                view_count=100,
+                duration_seconds=duration,
+            )
+
+        under_ten_minutes = self.repo.list_catalog(
+            lang=None,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+            max_duration_seconds=10 * 60,
+        )
+        count_under_ten = self.repo.count_catalog(
+            lang=None,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+            max_duration_seconds=10 * 60,
+        )
+
+        self.assertEqual([item["video_id"] for item in under_ten_minutes], ["short1"])
+        self.assertEqual(count_under_ten, 1)
 
     def test_needs_inspection_when_legacy_video_is_missing_published_at(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
@@ -756,6 +806,54 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual({item["video_id"] for item in manual}, {"manual_es"})
         self.assertEqual({item["video_id"] for item in automatic}, {"automatic_es"})
 
+    def test_spanish_manual_filter_accepts_unknown_original_when_spanish_track_is_not_auto(self) -> None:
+        source_id = self.repo.create_source(SourceInput("search", "Search", "demo", 10))
+        self.repo.upsert_candidate(
+            CandidateVideo(
+                "manual_unknown_original",
+                "Manual unknown original",
+                "Chan",
+                "chan1",
+                100,
+                None,
+                source_id,
+                to_iso(),
+            )
+        )
+        self.repo.store_inspection_result(
+            "manual_unknown_original",
+            audio_languages=["en", "es-US"],
+            has_dubbing=True,
+            published_at="2026-04-20",
+            view_count=100,
+            dub_kind="manual",
+            dub_evidence={
+                "source": "inspection",
+                "auto_dubbed_languages": [],
+                "spanish_non_original_inferred": True,
+            },
+        )
+
+        manual = self.repo.list_catalog(
+            lang=SPANISH_LANGUAGE_FILTER,
+            source_id=None,
+            channel=None,
+            query=None,
+            only_dubbed=True,
+            dub_kind="manual",
+        )
+
+        self.assertEqual([item["video_id"] for item in manual], ["manual_unknown_original"])
+        with self.repo.db.connect(profile="ui_read") as conn:
+            spanish_track = conn.execute(
+                """
+                SELECT is_original_audio
+                FROM video_audio_tracks
+                WHERE video_id = 'manual_unknown_original' AND language_base = 'es'
+                """
+            ).fetchone()
+        self.assertEqual(int(spanish_track["is_original_audio"]), 0)
+
     def test_spanish_catalog_hides_spanish_original_tracks(self) -> None:
         source_id = self.repo.create_source(SourceInput("search", "A", "demo", 5))
         rows = {
@@ -1186,6 +1284,28 @@ class RepositoryTests(unittest.TestCase):
         states = {row["video_id"]: row["state"] for row in self.repo.list_frontier_candidates()}
         self.assertEqual(states["cand1"], "verified")
         self.assertEqual(states["cand2"], "rejected")
+
+    def test_recover_frontier_candidates_requeues_stale_inspections(self) -> None:
+        self.repo.enqueue_candidate({"video_id": "stale1", "title": "Stale"}, priority=10)
+        self.repo.enqueue_candidate({"video_id": "fresh1", "title": "Fresh"}, priority=10)
+        claimed = self.repo.claim_frontier_candidates(limit=2)
+        self.assertEqual({item["video_id"] for item in claimed}, {"stale1", "fresh1"})
+
+        with self.repo.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE candidate_frontier
+                SET updated_at = '2026-01-01T00:00:00+00:00'
+                WHERE video_id = 'stale1'
+                """
+            )
+
+        recovered = self.repo.recover_frontier_candidates(stale_after_minutes=5)
+
+        self.assertEqual(recovered, 1)
+        states = {row["video_id"]: row["state"] for row in self.repo.list_frontier_candidates()}
+        self.assertEqual(states["stale1"], "queued")
+        self.assertEqual(states["fresh1"], "inspecting")
 
     def test_frontier_claim_prioritizes_less_saturated_channels(self) -> None:
         seed_id = self.repo.create_discovery_seed(
