@@ -1,151 +1,151 @@
 {
   "version": "v9",
-  "description": "CristianGhost-first discovery pool for reaction-friendly videos with Spanish manual dubbing potential. The 70% content lane is mixed by count: 36 high-fit CristianGhost topics, 12 lighter stream-bait topics, and 12 broader random evergreen topics. The 30% free lane remains starter and related videos so the app can still branch into unexpected dubbed content.",
+  "description": "Creator-oriented discovery pool for reaction-friendly videos with Spanish dubbing potential. The 70% content lane is mixed by count: 36 high-fit internet/commentary topics, 12 lighter stream-bait topics, and 12 broader random evergreen topics. The 30% free lane remains starter and related videos so the app can still branch into unexpected dubbed content.",
   "replace_existing_system_search": true,
   "disable_system_channels": true,
   "theme_queries": [
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "internet rabbit holes explained"
     },
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "bizarre online community documentary"
     },
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "4chan stories explained"
     },
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "lolcow documentary"
     },
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "weird internet subculture explained"
     },
     {
-      "family": "cristianghost_internet_lore",
+      "family": "internet_lore",
       "query": "creepy internet mystery explained"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "disturbing dashcam footage explained"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "mysterious photos explained"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "things caught on camera explained"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "creepy google maps discoveries"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "liminal spaces explained"
     },
     {
-      "family": "cristianghost_disturbing_visual",
+      "family": "disturbing_visual",
       "query": "lost media mystery explained"
     },
     {
-      "family": "cristianghost_drama_and_platforms",
+      "family": "drama_and_platforms",
       "query": "streamer controversy explained"
     },
     {
-      "family": "cristianghost_drama_and_platforms",
+      "family": "drama_and_platforms",
       "query": "canceled youtubers explained"
     },
     {
-      "family": "cristianghost_drama_and_platforms",
+      "family": "drama_and_platforms",
       "query": "social media app controversy"
     },
     {
-      "family": "cristianghost_drama_and_platforms",
+      "family": "drama_and_platforms",
       "query": "online creator scandal explained"
     },
     {
-      "family": "cristianghost_drama_and_platforms",
+      "family": "drama_and_platforms",
       "query": "fandoms that went too far"
     },
     {
-      "family": "cristianghost_cringe_and_trends",
+      "family": "cringe_and_trends",
       "query": "internet brainrot explained"
     },
     {
-      "family": "cristianghost_cringe_and_trends",
+      "family": "cringe_and_trends",
       "query": "generation alpha internet problem"
     },
     {
-      "family": "cristianghost_cringe_and_trends",
+      "family": "cringe_and_trends",
       "query": "cringe internet subcultures"
     },
     {
-      "family": "cristianghost_cringe_and_trends",
+      "family": "cringe_and_trends",
       "query": "strange internet trends explained"
     },
     {
-      "family": "cristianghost_cringe_and_trends",
+      "family": "cringe_and_trends",
       "query": "alpha male internet culture"
     },
     {
-      "family": "cristianghost_scams_and_fake_world",
+      "family": "scams_and_fake_world",
       "query": "fake gurus exposed"
     },
     {
-      "family": "cristianghost_scams_and_fake_world",
+      "family": "scams_and_fake_world",
       "query": "influencer scam explained"
     },
     {
-      "family": "cristianghost_scams_and_fake_world",
+      "family": "scams_and_fake_world",
       "query": "fake reality shows exposed"
     },
     {
-      "family": "cristianghost_scams_and_fake_world",
+      "family": "scams_and_fake_world",
       "query": "kickstarter scams that went too far"
     },
     {
-      "family": "cristianghost_media_games",
+      "family": "media_games",
       "query": "dark secrets of childhood shows"
     },
     {
-      "family": "cristianghost_media_games",
+      "family": "media_games",
       "query": "video game controversy explained"
     },
     {
-      "family": "cristianghost_media_games",
+      "family": "media_games",
       "query": "what happened to this game"
     },
     {
-      "family": "cristianghost_media_games",
+      "family": "media_games",
       "query": "disturbing reality tv shows"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "iceberg explained"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "the dark side of"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "what happened to"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "the rise and fall of"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "controversy timeline"
     },
     {
-      "family": "cristianghost_open_formats",
+      "family": "open_formats",
       "query": "why everyone hates"
     },
     {

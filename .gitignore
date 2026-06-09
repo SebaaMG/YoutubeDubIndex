@@ -12,6 +12,7 @@ output/
 tmp-*/
 backups/
 logs/
+weppy-project-sync/
 
 *.dump
 *.log

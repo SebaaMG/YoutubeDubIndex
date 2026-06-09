@@ -12,7 +12,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8876
     db_filename: str = "dub_index_desktop.db"
-    app_version: str = "2026.05.17.1"
+    app_version: str = "1.0.0"
     app_title: str = ""
     startup_test_video_id: str = "dQw4w9WgXcQ"
     inspect_workers: int = 4

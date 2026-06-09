@@ -1,52 +1,77 @@
-# Desktop YouTube Dub Finder
+# YouTubeDubIndex
 
-Desktop app nativa `PySide6` para Windows que indexa videos de YouTube con doblaje espanol confirmado.
+YouTubeDubIndex is a Windows desktop app for finding YouTube videos that have Spanish audio tracks. It keeps a local SQLite catalog, inspects videos in the background, and lets you browse confirmed dubbed videos with a dense native UI.
 
-## Ejecutar con Python
+The app is designed for creators and streamers who want a ready-to-browse pool of videos with Spanish dubbing before deciding what to watch, react to, or save.
+
+## Features
+
+- Native Windows UI built with PySide6.
+- Local-first portable data model backed by SQLite.
+- Confirmed Spanish dubbing catalog with filters for language, upload date, dub type, favorites, and maximum video duration.
+- Manual discovery through `Explore 250`, with progress updates every inspection chunk.
+- Optional automatic discovery every five minutes while the app is open.
+- Separate discovery worker process so YouTube parsing, yt-dlp work, and SQLite writes do not block the UI.
+- Thumbnail loading with backpressure and caching for smoother scrolling.
+- Curated reaction-oriented discovery pool plus related-video expansion.
+- One-folder portable Windows build with the worker executable stored under `_internal`.
+
+## Download
+
+Use the latest GitHub Release, download the Windows ZIP, extract it, and run:
+
+```text
+YouTubeDubIndexer.exe
+```
+
+The app stores portable data next to the executable in:
+
+```text
+data\dub_index_desktop.db
+```
+
+Keep the extracted folder together. The `_internal` directory contains bundled runtime files and the background worker used by the app.
+
+## Running From Source
+
+Requirements:
+
+- Windows 10 or newer
+- Python 3.11+
+- Git
 
 ```powershell
-cd J:\Users\SebaM\Documents\Codex\2026-04-21-hay-alguna-forma-de-hacer-que-desktop-fork
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-## Generar `.exe` autosuficiente
+## Building The Portable App
 
 ```powershell
-cd J:\Users\SebaM\Documents\Codex\2026-04-21-hay-alguna-forma-de-hacer-que-desktop-fork
 .\build_exe.ps1
 ```
 
-Salida esperada:
+Expected output:
 
 ```text
 dist\YouTubeDubIndexer\YouTubeDubIndexer.exe
 ```
 
-## Que incluye
+The build script copies a consistent SQLite database into the portable build when a source database is available. You can pass an explicit database if needed:
 
-- UI nativa `PySide6 Widgets`
-- Persistencia local SQLite
-  - modo Python: `data\dub_index_desktop.db` dentro del proyecto
-  - `.exe` empaquetado: `dist\YouTubeDubIndexer\data\dub_index_desktop.db`, junto al ejecutable
-- Catalogo principal `Descubrir`, con filtros de idioma, fecha, favoritos y tipo de dub
-- Busqueda rapida por tema o canal: guarda el interes como seed permanente y encola 150 candidatos iniciales en background
-- Boton `Explorar 200`: inspecciona hasta 200 candidatos por click usando el mismo algoritmo de descubrimiento
-- Discovery con `yt-dlp`
-- Deteccion de doblaje mediante `audioTracks` del watch page
-- Filtro de tipo de dub: `Todos los dubs`, `IA` y `No IA`, sin mostrar origen no confirmado en el catalogo final
-- Starter pack local y pool de descubrimiento incluido en el bundle
-- Bundle `one-folder` con `node.exe` incluido
+```powershell
+.\build_exe.ps1 -SourceDb J:\path\to\dub_index_desktop.db
+```
 
-La app empaquetada usa modo portable: para compartirla con el mismo catalogo, comparte la carpeta completa `dist\YouTubeDubIndexer\`, incluyendo `data\dub_index_desktop.db` y `_internal\`. Si existe una base antigua en `%LOCALAPPDATA%\YouTubeDubIndexer\data\`, la primera apertura de la nueva build la copia automaticamente a la carpeta portable cuando todavia no hay DB junto al `.exe`.
+## Development Checks
 
-El script `build_exe.ps1` exporta una copia consistente de la DB actual al terminar el build. Si encuentra varias DB posibles, usa la mas reciente entre una DB portable previa, `%LOCALAPPDATA%` y `data\` del proyecto. El pool de descubrimiento va dentro del bundle en `_internal\resources\discovery\`.
+```powershell
+python -m pytest -q
+python -m PyInstaller --noconfirm YouTubeDubIndexer.spec
+```
 
-## Descubrimiento automatico
+Performance harnesses live in `tools/perf/` for catalog scrolling, repository queries, and UI-under-search checks.
 
-El crawler local no intenta indexar todo YouTube. Usa una mezcla simple de seeds para encontrar candidatos con mas probabilidad de servir como material reaccionable:
+## Notes
 
-- 70% pool de contenido: busquedas amplias por familias incluidas en `resources/discovery/content_pool_v9.json` mas busquedas/canales escritos por el usuario.
-- 30% YouTube libre: starter videos y videos relacionados de dubs ya verificados.
-
-El patron se aplica al elegir seeds de descubrimiento, no al orden final del catalogo. No hay ranking dinamico global ni recalculo sobre millones de filas; los candidatos se encolan y luego solo entran al feed si pasan la inspeccion de dub espanol confirmado.
+YouTubeDubIndex uses publicly available YouTube metadata and audio-track information through local tooling. It is not affiliated with YouTube. Videos only become visible in the catalog after local inspection confirms Spanish dubbing.
