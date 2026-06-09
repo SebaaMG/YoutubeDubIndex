@@ -19,7 +19,7 @@ The app is local-first: discovery, inspection results, favorites, and filters ar
 - Native Windows UI built with PySide6.
 - Local SQLite catalog stored beside the app in portable builds.
 - Language filters built from detected audio tracks, with Spanish grouped as a single option and other detected languages selectable individually.
-- Manual vs automatic dub filtering for Spanish tracks when inspection finds enough evidence.
+- Manual vs automatic dub filtering for Spanish tracks.
 - Search, source, channel, year, duration, sorting, and favorites filters.
 - Manual discovery through `Explore 250`, plus optional automatic discovery every five minutes while the app is open.
 - Separate discovery worker process so YouTube parsing, `yt-dlp` work, and SQLite writes do not block the UI.
