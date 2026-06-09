@@ -1,0 +1,248 @@
+{
+  "version": "v9",
+  "description": "Packaged discovery seeds for finding videos likely to have Spanish audio tracks. The curated lane mixes internet culture, media, technology, commentary, and evergreen topics. The free lane uses starter and related videos so discovery can branch into unexpected dubbed content.",
+  "replace_existing_system_search": true,
+  "disable_system_channels": true,
+  "theme_queries": [
+    {
+      "family": "internet_lore",
+      "query": "internet rabbit holes explained"
+    },
+    {
+      "family": "internet_lore",
+      "query": "bizarre online community documentary"
+    },
+    {
+      "family": "internet_lore",
+      "query": "4chan stories explained"
+    },
+    {
+      "family": "internet_lore",
+      "query": "lolcow documentary"
+    },
+    {
+      "family": "internet_lore",
+      "query": "weird internet subculture explained"
+    },
+    {
+      "family": "internet_lore",
+      "query": "creepy internet mystery explained"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "disturbing dashcam footage explained"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "mysterious photos explained"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "things caught on camera explained"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "creepy google maps discoveries"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "liminal spaces explained"
+    },
+    {
+      "family": "disturbing_visual",
+      "query": "lost media mystery explained"
+    },
+    {
+      "family": "drama_and_platforms",
+      "query": "online platform controversy explained"
+    },
+    {
+      "family": "drama_and_platforms",
+      "query": "canceled youtubers explained"
+    },
+    {
+      "family": "drama_and_platforms",
+      "query": "social media app controversy"
+    },
+    {
+      "family": "drama_and_platforms",
+      "query": "online personality scandal explained"
+    },
+    {
+      "family": "drama_and_platforms",
+      "query": "fandoms that went too far"
+    },
+    {
+      "family": "cringe_and_trends",
+      "query": "internet brainrot explained"
+    },
+    {
+      "family": "cringe_and_trends",
+      "query": "generation alpha internet problem"
+    },
+    {
+      "family": "cringe_and_trends",
+      "query": "cringe internet subcultures"
+    },
+    {
+      "family": "cringe_and_trends",
+      "query": "strange internet trends explained"
+    },
+    {
+      "family": "cringe_and_trends",
+      "query": "alpha male internet culture"
+    },
+    {
+      "family": "scams_and_fake_world",
+      "query": "fake gurus exposed"
+    },
+    {
+      "family": "scams_and_fake_world",
+      "query": "influencer scam explained"
+    },
+    {
+      "family": "scams_and_fake_world",
+      "query": "fake reality shows exposed"
+    },
+    {
+      "family": "scams_and_fake_world",
+      "query": "kickstarter scams that went too far"
+    },
+    {
+      "family": "media_games",
+      "query": "dark secrets of childhood shows"
+    },
+    {
+      "family": "media_games",
+      "query": "video game controversy explained"
+    },
+    {
+      "family": "media_games",
+      "query": "what happened to this game"
+    },
+    {
+      "family": "media_games",
+      "query": "disturbing reality tv shows"
+    },
+    {
+      "family": "open_formats",
+      "query": "iceberg explained"
+    },
+    {
+      "family": "open_formats",
+      "query": "the dark side of"
+    },
+    {
+      "family": "open_formats",
+      "query": "what happened to"
+    },
+    {
+      "family": "open_formats",
+      "query": "the rise and fall of"
+    },
+    {
+      "family": "open_formats",
+      "query": "controversy timeline"
+    },
+    {
+      "family": "open_formats",
+      "query": "why everyone hates"
+    },
+    {
+      "family": "general_interest",
+      "query": "bad mobile game ads"
+    },
+    {
+      "family": "general_interest",
+      "query": "worst products ever made"
+    },
+    {
+      "family": "general_interest",
+      "query": "weird products that actually exist"
+    },
+    {
+      "family": "general_interest",
+      "query": "absurd luxury products"
+    },
+    {
+      "family": "general_interest",
+      "query": "weird apps explained"
+    },
+    {
+      "family": "general_interest",
+      "query": "internet memes explained"
+    },
+    {
+      "family": "general_interest",
+      "query": "ranking internet trends"
+    },
+    {
+      "family": "general_interest",
+      "query": "strange internet challenges"
+    },
+    {
+      "family": "general_interest",
+      "query": "weirdest reality shows"
+    },
+    {
+      "family": "general_interest",
+      "query": "terrible games explained"
+    },
+    {
+      "family": "general_interest",
+      "query": "horrible room makeover"
+    },
+    {
+      "family": "general_interest",
+      "query": "internet submissions cringe"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "unsolved mysteries explained"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "urban legends that turned out true"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "bizarre true stories documentary"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "real stories that sound fake"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "survival story explained"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "experiments that went too far"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "forbidden places explained"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "dangerous jobs documentary"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "science facts that sound fake"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "weird laws explained"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "dangerous objects explained"
+    },
+    {
+      "family": "random_evergreen",
+      "query": "things society pretends are normal"
+    }
+  ]
+}
